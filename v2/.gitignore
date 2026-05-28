@@ -1,0 +1,12 @@
+# Widevine device files — NEVER commit
+*.wvd
+private_key.pem
+client_id.bin
+
+# transient HLS output from ffmpeg pipes
+live/
+
+# python virtualenv for cdm.py
+.venv/
+__pycache__/
+*.pyc

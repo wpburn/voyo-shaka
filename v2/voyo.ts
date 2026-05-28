@@ -1,6 +1,12 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write --allow-net --allow-env
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-net --allow-env --allow-run
 // Voyo Live — single-file Deno 2 server.
-// Routes:  GET /  • GET /api/channels  • POST /api/login  • GET /live/:id.m3u8  • GET /live.m3u8  • GET /proxy?url=
+// Routes:  GET /  • GET /api/channels  • POST /api/login
+//          • GET /live/:id.m3u8           — non-DRM, HLS pass-through
+//          • GET /live.m3u8               — combined VLC playlist (?mode=all includes DRM)
+//          • GET /vlc/:id/index.m3u8      — server-decrypted DRM live (needs cdm.py sidecar)
+//          • GET /api/keys/:id            — debug: hex content keys from sidecar
+//          • GET /play/:id, /mosaic       — in-browser Shaka players (Chrome Widevine)
+//          • GET /proxy?url=              — generic CORS/header passthrough used by /live
 
 import { crypto as stdCrypto } from "jsr:@std/crypto/crypto";
 
@@ -132,6 +138,234 @@ async function resolveStream(channelId: string, token: string, uuid: string): Pr
   return info;
 }
 
+// === Stream info cache (signed URLs expire; ~30 min is safe) ===
+const STREAM_TTL_MS = 30 * 60 * 1000;
+const streamCache = new Map<string, { info: StreamInfo; expiresAt: number }>();
+
+async function getStreamInfo(channelId: string, force = false): Promise<StreamInfo> {
+  if (!force) {
+    const hit = streamCache.get(channelId);
+    if (hit && hit.expiresAt > Date.now()) return hit.info;
+  }
+  const info = await withAuth((t, u) => resolveStream(channelId, t, u));
+  streamCache.set(channelId, { info, expiresAt: Date.now() + STREAM_TTL_MS });
+  return info;
+}
+
+// === Widevine: PSSH extraction + CDM sidecar client + key cache ===
+const CDM_URL = Deno.env.get("VOYO_CDM_URL") ?? "http://127.0.0.1:8091";
+const KEY_TTL_MS = 30 * 60 * 1000;
+const WIDEVINE_SYSTEM_ID = "edef8ba9-79d6-4ace-a3c8-27dceb5404f0";
+
+type ContentKey = { kid: string; key: string };
+const keyCache = new Map<string, { keys: ContentKey[]; expiresAt: number }>();
+
+async function extractPssh(mpdUrl: string): Promise<string> {
+  const res = await fetch(mpdUrl, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" },
+  });
+  if (!res.ok) throw new HttpError(res.status, `MPD fetch: ${res.status}`);
+  const xml = await res.text();
+  // Match any Widevine-like ContentProtection block (various UUID suffixes in the wild)
+  const cpRe = new RegExp(
+    `<ContentProtection[^>]*schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-[0-9a-f]+"[^>]*>([\\s\\S]*?)</ContentProtection>`,
+    "gi",
+  );
+  let m: RegExpExecArray | null;
+  while ((m = cpRe.exec(xml)) !== null) {
+    const psshM = /<(?:[\w-]+:)?pssh[^>]*>\s*([A-Za-z0-9+/=]+)\s*<\/(?:[\w-]+:)?pssh>/i.exec(m[1]);
+    if (psshM) return psshM[1].trim();
+  }
+  throw new Error("no Widevine PSSH found in MPD");
+}
+
+async function getKeys(channelId: string, force = false): Promise<ContentKey[]> {
+  if (!force) {
+    const hit = keyCache.get(channelId);
+    if (hit && hit.expiresAt > Date.now()) return hit.keys;
+  }
+  const info = await getStreamInfo(channelId, force);
+  if (!info.drm) throw new Error(`channel ${channelId} is not DRM`);
+  const pssh = await extractPssh(info.url);
+  let res: Response;
+  try {
+    res = await fetch(`${CDM_URL}/keys`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pssh, licenseUrl: info.drm.url, headers: info.drm.headers }),
+    });
+  } catch (e) {
+    throw new Error(`CDM sidecar unreachable at ${CDM_URL} — is cdm.py running? (${(e as Error).message})`);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new HttpError(res.status, `CDM: ${body || res.status}`);
+  }
+  const keys = await res.json() as ContentKey[];
+  if (!Array.isArray(keys) || keys.length === 0) throw new Error("CDM returned no content keys");
+  keyCache.set(channelId, { keys, expiresAt: Date.now() + KEY_TTL_MS });
+  return keys;
+}
+
+// === FFmpeg pipe manager: spawns ffmpeg per channel, transmuxes decrypted DASH → local HLS ===
+const FFMPEG = Deno.env.get("VOYO_FFMPEG") ?? "ffmpeg";
+const LIVE_DIR = `${CONFIG_DIR}/live`;
+const PIPE_IDLE_MS = 60 * 1000;
+const PIPE_READY_TIMEOUT_MS = 20_000;
+
+type Pipe = {
+  proc: Deno.ChildProcess;
+  dir: string;
+  ready: Promise<string>;
+  lastAccess: number;
+};
+const pipes = new Map<string, Pipe>();
+
+async function clearDir(dir: string): Promise<void> {
+  try {
+    for await (const entry of Deno.readDir(dir)) {
+      await Deno.remove(`${dir}/${entry.name}`).catch(() => {});
+    }
+  } catch (e) {
+    if (!(e instanceof Deno.errors.NotFound)) throw e;
+  }
+}
+
+async function waitForPlaylist(path: string, deadline: number): Promise<string> {
+  while (Date.now() < deadline) {
+    try {
+      const st = await Deno.stat(path);
+      if (st.isFile && st.size > 0) {
+        // Also wait until at least one segment exists, so VLC doesn't hit a 404 immediately.
+        const body = await Deno.readTextFile(path);
+        if (/\.ts(\?|$|\n)/m.test(body) || /#EXT-X-ENDLIST/.test(body)) return path;
+      }
+    } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error("ffmpeg did not produce a usable playlist in time");
+}
+
+async function startPipe(channelId: string): Promise<Pipe> {
+  const dir = `${LIVE_DIR}/${channelId}`;
+  await Deno.mkdir(dir, { recursive: true });
+  await clearDir(dir);
+
+  const info = await getStreamInfo(channelId);
+  if (!info.drm) throw new Error("channel is not DRM — use /live/<id>.m3u8");
+  const keys = await getKeys(channelId);
+
+  // ffmpeg's `-decryption_key` accepts ONE key. Voyo live MPDs we've seen use the same KID
+  // for audio + video, so the first key works. If you hit a multi-key stream, swap to
+  // shaka-packager (commented at the bottom of this function) — it supports per-stream keys.
+  const args = [
+    "-loglevel", "warning",
+    "-allowed_extensions", "ALL",
+    "-decryption_key", keys[0].key,
+    "-i", info.url,
+    "-c", "copy",
+    "-f", "hls",
+    "-hls_time", "4",
+    "-hls_list_size", "8",
+    "-hls_flags", "delete_segments+append_list+independent_segments+omit_endlist",
+    "-hls_segment_filename", `${dir}/seg-%05d.ts`,
+    `${dir}/index.m3u8`,
+  ];
+  console.log(`[ffmpeg ${channelId}] spawning: ${FFMPEG} ${args.join(" ")}`);
+  const proc = new Deno.Command(FFMPEG, {
+    args,
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+
+  // Stream ffmpeg's stderr to our console with a channel prefix.
+  (async () => {
+    const dec = new TextDecoder();
+    for await (const chunk of proc.stderr) {
+      for (const line of dec.decode(chunk).split("\n")) {
+        if (line.trim()) console.log(`[ffmpeg ${channelId}] ${line}`);
+      }
+    }
+  })();
+  (async () => {
+    const dec = new TextDecoder();
+    for await (const chunk of proc.stdout) {
+      for (const line of dec.decode(chunk).split("\n")) {
+        if (line.trim()) console.log(`[ffmpeg ${channelId}] ${line}`);
+      }
+    }
+  })();
+
+  const ready = waitForPlaylist(`${dir}/index.m3u8`, Date.now() + PIPE_READY_TIMEOUT_MS);
+  const pipe: Pipe = { proc, dir, ready, lastAccess: Date.now() };
+  pipes.set(channelId, pipe);
+
+  proc.status.then((s) => {
+    console.log(`[ffmpeg ${channelId}] exited code=${s.code} signal=${s.signal}`);
+    if (pipes.get(channelId) === pipe) pipes.delete(channelId);
+  });
+
+  // If ffmpeg never produces a playlist, surface the failure and kill the process.
+  ready.catch((e) => {
+    console.error(`[ffmpeg ${channelId}] ${(e as Error).message} — killing`);
+    try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+    if (pipes.get(channelId) === pipe) pipes.delete(channelId);
+  });
+
+  return pipe;
+}
+
+async function ensurePipe(channelId: string): Promise<string> {
+  const existing = pipes.get(channelId);
+  if (existing) {
+    existing.lastAccess = Date.now();
+    await existing.ready;
+    return existing.dir;
+  }
+  const pipe = await startPipe(channelId);
+  await pipe.ready;
+  pipe.lastAccess = Date.now();
+  return pipe.dir;
+}
+
+// Periodic sweep: kill ffmpegs that haven't been touched for a while.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, p] of pipes) {
+    if (now - p.lastAccess > PIPE_IDLE_MS) {
+      console.log(`[pipe ${id}] idle ${Math.round((now - p.lastAccess) / 1000)}s — killing ffmpeg`);
+      try { p.proc.kill("SIGTERM"); } catch { /* ignore */ }
+      pipes.delete(id);
+    }
+  }
+}, 15_000);
+
+async function serveLiveFile(channelId: string, filename: string): Promise<Response> {
+  const pipe = pipes.get(channelId);
+  if (pipe) pipe.lastAccess = Date.now();
+  // Reject path traversal.
+  if (filename.includes("/") || filename.includes("..")) {
+    return new Response("bad path", { status: 400 });
+  }
+  const path = `${LIVE_DIR}/${channelId}/${filename}`;
+  try {
+    const f = await Deno.open(path, { read: true });
+    const ct = filename.endsWith(".m3u8")
+      ? "application/vnd.apple.mpegurl"
+      : filename.endsWith(".ts")
+      ? "video/mp2t"
+      : filename.endsWith(".m4s") || filename.endsWith(".mp4")
+      ? "video/mp4"
+      : "application/octet-stream";
+    return new Response(f.readable, {
+      headers: { "Content-Type": ct, "Cache-Control": "no-store" },
+    });
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+}
+
 // === Config store with mutex ===
 let writeLock: Promise<unknown> = Promise.resolve();
 let config: Config;
@@ -244,7 +478,10 @@ function rewritePlaylist(body: string, baseUrl: string): string {
 async function buildLivePlaylist(channelId: string): Promise<Response> {
   const info = await withAuth((t, u) => resolveStream(channelId, t, u));
   if (info.isDrm) {
-    return new Response(`channel ${channelId} is DRM (DASH+Widevine); not supported by this proxy`, { status: 415 });
+    return new Response(
+      `channel ${channelId} is DRM (DASH+Widevine); open /play/${channelId} in Chrome instead`,
+      { status: 415 },
+    );
   }
   const masterRes = await fetch(info.url);
   if (!masterRes.ok) return new Response(`upstream ${masterRes.status}`, { status: masterRes.status });
@@ -310,12 +547,22 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path === "/live.m3u8") {
+    // mode=hls   → only non-DRM (legacy default, safest for VLC if CDM is offline)
+    // mode=all   → DRM channels too, via /vlc/<id>/index.m3u8 (needs cdm.py running)
+    // mode=vlc   → alias for "all"
     try {
+      const mode = url.searchParams.get("mode") ?? "all";
+      const includeDrm = mode === "all" || mode === "vlc";
       const channels = await getChannels();
       const lines = ["#EXTM3U"];
       for (const ch of channels) {
+        const isDrmName = /drm|cetin|widevine/i.test(ch.name);
+        const target = isDrmName
+          ? (includeDrm ? `http://${host}/vlc/${ch.id}/index.m3u8` : null)
+          : `http://${host}/live/${ch.id}.m3u8`;
+        if (!target) continue;
         lines.push(`#EXTINF:-1 tvg-id="${ch.id}" tvg-logo="${ch.img}" group-title="Voyo",${ch.name}`);
-        lines.push(`http://${host}/live/${ch.id}.m3u8`);
+        lines.push(target);
       }
       return new Response(lines.join("\n") + "\n", {
         headers: { "Content-Type": "application/vnd.apple.mpegurl" },
@@ -338,11 +585,109 @@ async function handle(req: Request): Promise<Response> {
     }
   }
 
+  // Debug: hex content keys from CDM sidecar. ?force=1 bypasses the cache.
+  if (method === "GET" && path.startsWith("/api/keys/")) {
+    const requested = path.slice("/api/keys/".length);
+    try {
+      await getChannels();
+      const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
+      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
+      const keys = await getKeys(ch.id, url.searchParams.get("force") === "1");
+      return Response.json(keys);
+    } catch (e) {
+      return Response.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
+  // Server-decrypted HLS for VLC / IPTV apps. /vlc/<id>/index.m3u8 is the playlist,
+  // segments are siblings (relative URIs in the playlist resolve under /vlc/<id>/).
+  if (method === "GET" && path.startsWith("/vlc/")) {
+    const rest = path.slice("/vlc/".length);
+    const slash = rest.indexOf("/");
+    // /vlc/<id>.m3u8 → redirect to canonical /vlc/<id>/index.m3u8
+    if (slash < 0 && rest.endsWith(".m3u8")) {
+      const id = rest.slice(0, -".m3u8".length);
+      return Response.redirect(`http://${host}/vlc/${id}/index.m3u8`, 302);
+    }
+    if (slash <= 0) return new Response("bad path", { status: 400 });
+    const requested = rest.slice(0, slash);
+    const filename = rest.slice(slash + 1);
+    try {
+      await getChannels();
+      const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
+      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      // Only the playlist request triggers ffmpeg startup; segment requests just read files.
+      if (filename === "index.m3u8") await ensurePipe(ch.id);
+      return await serveLiveFile(ch.id, filename);
+    } catch (e) {
+      console.error(`[vlc] ${requested}/${filename}:`, (e as Error).message);
+      return new Response((e as Error).message, { status: 500 });
+    }
+  }
+
+  // JSON stream info for the in-browser player. For DRM channels, licenseUrl is /license/<id>
+  // so the browser doesn't need the upstream Voyo bearer token.
+  if (method === "GET" && path.startsWith("/api/stream/")) {
+    const requested = path.slice("/api/stream/".length);
+    try {
+      await getChannels();
+      const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
+      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
+      const info = await getStreamInfo(ch.id);
+      return Response.json({
+        id: ch.id,
+        name: ch.name,
+        manifestUrl: info.url,
+        isDrm: info.isDrm,
+        licenseUrl: info.drm ? `/license/${ch.id}` : null,
+      });
+    } catch (e) {
+      streamCache.delete(requested);
+      return Response.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
+  // Widevine license proxy: forwards the challenge to Voyo's license server with the
+  // saved Authorization headers, returns the binary license back to Shaka.
+  if (method === "POST" && path.startsWith("/license/")) {
+    const requested = path.slice("/license/".length);
+    try {
+      await getChannels();
+      const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
+      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      let info = await getStreamInfo(ch.id);
+      if (!info.drm) return new Response(`channel ${requested} is not DRM`, { status: 400 });
+      const body = await req.arrayBuffer();
+      let upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
+      if (upstream.status === 401 || upstream.status === 403) {
+        // Signed URL or token went stale — refresh once.
+        info = await getStreamInfo(ch.id, true);
+        if (info.drm) upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
+      }
+      const ct = upstream.headers.get("content-type") ?? "application/octet-stream";
+      return new Response(upstream.body, { status: upstream.status, headers: { "Content-Type": ct } });
+    } catch (e) {
+      console.error(`[license] ${requested}:`, (e as Error).message);
+      return new Response((e as Error).message, { status: 502 });
+    }
+  }
+
+  if (method === "GET" && path.startsWith("/play/")) {
+    return new Response(PLAY_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+
+  if (method === "GET" && path === "/mosaic") {
+    return new Response(MOSAIC_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+
   if (method === "GET" && path === "/proxy") {
     const target = url.searchParams.get("url");
     if (!target) return new Response("missing url", { status: 400 });
     try {
-      const upstream = await fetch(target);
+      const upstreamHeaders: Record<string, string> = {};
+      const range = req.headers.get("range");
+      if (range) upstreamHeaders["Range"] = range;
+      const upstream = await fetch(target, { headers: upstreamHeaders });
       const ct = upstream.headers.get("content-type");
       if (isM3u8(target, ct)) {
         const body = await upstream.text();
@@ -352,9 +697,10 @@ async function handle(req: Request): Promise<Response> {
         });
       }
       const headers = new Headers();
-      if (ct) headers.set("Content-Type", ct);
-      const len = upstream.headers.get("content-length");
-      if (len) headers.set("Content-Length", len);
+      for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "cache-control"]) {
+        const v = upstream.headers.get(h);
+        if (v) headers.set(h, v);
+      }
       return new Response(upstream.body, { status: upstream.status, headers });
     } catch (e) {
       return new Response((e as Error).message, { status: 502 });
@@ -402,6 +748,7 @@ const INDEX_HTML = `<!doctype html>
   <h1>Voyo Live</h1>
   <button id="refresh" title="Refresh channels list">↻ Refresh</button>
   <button id="relogin" title="Force a new login">🔑 Re-login</button>
+  <button id="mosaic2" title="Open 2 selected channels in a 1x2 mosaic">▦ Mosaic 2</button>
   <span class="combo">VLC playlist: <a id="combo" href="/live.m3u8">/live.m3u8</a></span>
 </header>
 <table>
@@ -433,20 +780,27 @@ function render(channels) {
   if (!channels.length) { rows.innerHTML = '<tr><td colspan="3" class="empty">No channels yet — try Re-login then Refresh.</td></tr>'; return; }
   const isDrm = (n) => /drm|cetin|widevine/i.test(n);
   rows.innerHTML = channels.map(c => {
+    const drm = isDrm(c.name);
     const img = c.img ? '<img class="logo" src="' + c.img + '" loading="lazy" alt="">' : '';
-    const lock = isDrm(c.name) ? '<span class="lock" title="Has DRM (may not play in VLC)">🔒</span>' : '';
-    const url = '/live/' + c.id + '.m3u8';
+    const lock = drm ? '<span class="lock" title="DRM — VLC link uses server-side decrypt via cdm.py">🔒</span>' : '';
+    // For DRM channels the VLC-friendly URL is the server-decrypted /vlc/<id>/index.m3u8.
+    const hls = drm ? '/vlc/' + c.id + '/index.m3u8' : '/live/' + c.id + '.m3u8';
+    const play = '/play/' + c.id;
     return '<tr>' +
       '<td style="width:80px">' + img + '</td>' +
-      '<td><span class="name">' + c.name + '</span>' + lock + '</td>' +
-      '<td class="actions"><a href="' + url + '" target="_blank">open</a><button data-id="' + c.id + '">📋 Copy URL</button></td>' +
+      '<td><label><input type="checkbox" class="pick" data-id="' + c.id + '" data-name="' + c.name + '"> <span class="name">' + c.name + '</span>' + lock + '</label></td>' +
+      '<td class="actions">' +
+        '<a href="' + play + '" target="_blank">▶ Play</a>' +
+        '<a href="' + hls + '" target="_blank" data-url="' + hls + '">' + (drm ? '.m3u8 (VLC)' : '.m3u8') + '</a>' +
+        '<button data-id="' + c.id + '" data-url="' + hls + '">📋 Copy URL</button>' +
+      '</td>' +
     '</tr>';
   }).join('');
 }
 rows.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-id]');
   if (!btn) return;
-  const url = location.protocol + '//' + location.host + '/live/' + btn.dataset.id + '.m3u8';
+  const url = location.protocol + '//' + location.host + (btn.dataset.url || '/live/' + btn.dataset.id + '.m3u8');
   navigator.clipboard.writeText(url).then(() => toast('Copied: ' + url));
 });
 document.getElementById('refresh').onclick = () => load(true);
@@ -460,7 +814,163 @@ document.getElementById('relogin').onclick = async () => {
     load(true);
   } catch (e) { toast('Error: ' + e.message, true); }
 };
+document.getElementById('mosaic2').onclick = () => {
+  const picked = [...document.querySelectorAll('input.pick:checked')].map(i => i.dataset.id);
+  if (picked.length < 2) { toast('Tick at least 2 channels first', true); return; }
+  window.open('/mosaic?ids=' + picked.slice(0, 2).join(','), '_blank');
+};
 load(false);
+</script>
+</body>
+</html>`;
+
+// Single-channel Shaka player with audio-output-device picker (setSinkId).
+// Designed for OBS Window Capture: one channel per Chrome window, route audio to a
+// per-channel virtual device (BlackHole on macOS, VB-CABLE on Windows), then have
+// OBS pick that device as the audio source. Two windows → two OBS instances → two platforms.
+const PLAY_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voyo Player</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/shaka-player@4.11.7/dist/shaka-player.compiled.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 13px system-ui, -apple-system, sans-serif; }
+  .wrap { display: flex; flex-direction: column; height: 100%; }
+  video { flex: 1 1 auto; min-height: 0; background: #000; width: 100%; }
+  .bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #111; border-top: 1px solid #222; flex-wrap: wrap; }
+  .bar select, .bar button { background: #1e2230; color: #ddd; border: 1px solid #2a3142; border-radius: 4px; padding: 4px 8px; font: inherit; cursor: pointer; }
+  .bar select:hover, .bar button:hover { background: #252b3c; }
+  .bar .name { margin-right: auto; font-weight: 500; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar label { display: inline-flex; align-items: center; gap: 6px; opacity: .85; }
+  .status { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; opacity: .55; }
+  .status.err { color: #f88; opacity: 1; }
+  body.embed .bar { padding: 4px 6px; font-size: 11px; }
+  body.embed .bar select, body.embed .bar button { padding: 2px 6px; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <video id="v" autoplay muted playsinline controls></video>
+  <div class="bar">
+    <span class="name" id="name">…</span>
+    <label>🔊 <select id="sink" title="Audio output device — pick a virtual device (BlackHole / VB-CABLE) per stream"></select></label>
+    <button id="pickAudio" title="Grant mic to reveal device names">Reveal devices</button>
+    <button id="mute">Unmute</button>
+    <span class="status" id="status">…</span>
+  </div>
+</div>
+<script>
+(async () => {
+  if (new URLSearchParams(location.search).get('embed') === '1') document.body.classList.add('embed');
+  const id = decodeURIComponent(location.pathname.replace(/^\\/play\\//, ''));
+  const nameEl = document.getElementById('name');
+  const statusEl = document.getElementById('status');
+  const sinkSel = document.getElementById('sink');
+  const muteBtn = document.getElementById('mute');
+  const pickBtn = document.getElementById('pickAudio');
+  const video = document.getElementById('v');
+  const setStatus = (s, err) => { statusEl.textContent = s; statusEl.classList.toggle('err', !!err); };
+
+  if (typeof shaka === 'undefined') { setStatus('shaka failed to load', true); return; }
+  shaka.polyfill.installAll();
+  if (!shaka.Player.isBrowserSupported()) { setStatus('browser not supported (need EME/MSE)', true); return; }
+
+  setStatus('resolving…');
+  let info;
+  try {
+    const r = await fetch('/api/stream/' + encodeURIComponent(id));
+    info = await r.json();
+    if (!r.ok || info.error) throw new Error(info.error || ('HTTP ' + r.status));
+  } catch (e) { setStatus(e.message, true); return; }
+  nameEl.textContent = info.name || id;
+  document.title = (info.name || id) + ' — Voyo';
+
+  const player = new shaka.Player(video);
+  if (info.licenseUrl) {
+    player.configure({ drm: { servers: { 'com.widevine.alpha': info.licenseUrl } } });
+  }
+  const ORIGIN = location.origin;
+  const PROXY = ORIGIN + '/proxy?url=';
+  const ne = player.getNetworkingEngine();
+  ne.registerRequestFilter((type, request) => {
+    if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) return;
+    request.uris = request.uris.map(u => u.startsWith(ORIGIN) ? u : (PROXY + encodeURIComponent(u)));
+  });
+  ne.registerResponseFilter((type, response) => {
+    if (response.uri && response.uri.startsWith(PROXY)) response.uri = decodeURIComponent(response.uri.slice(PROXY.length));
+    if (response.originalUri && response.originalUri.startsWith(PROXY)) response.originalUri = decodeURIComponent(response.originalUri.slice(PROXY.length));
+  });
+  player.addEventListener('error', (e) => setStatus('shaka ' + e.detail.code + ': ' + (e.detail.data && e.detail.data[0] || ''), true));
+
+  setStatus('loading…');
+  try {
+    await player.load(info.manifestUrl);
+    setStatus(info.isDrm ? 'DRM playing' : 'playing');
+  } catch (e) { setStatus('load: ' + (e.message || JSON.stringify(e)), true); return; }
+
+  async function refreshSinks(prompt) {
+    try {
+      if (prompt) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+      }
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const outs = devices.filter(d => d.kind === 'audiooutput');
+      const current = sinkSel.value;
+      sinkSel.innerHTML = outs.map(d => '<option value="' + d.deviceId + '">' + (d.label || ('Device ' + d.deviceId.slice(0, 6))) + '</option>').join('');
+      if (outs.some(d => d.deviceId === current)) sinkSel.value = current;
+    } catch (e) { console.warn('refreshSinks', e); }
+  }
+  await refreshSinks(false);
+  pickBtn.onclick = () => refreshSinks(true);
+  sinkSel.onchange = async () => {
+    if (typeof video.setSinkId !== 'function') { alert('setSinkId not supported (use Chrome/Edge)'); return; }
+    try { await video.setSinkId(sinkSel.value); }
+    catch (e) { alert('setSinkId failed: ' + e.message); }
+  };
+  muteBtn.onclick = () => { video.muted = !video.muted; muteBtn.textContent = video.muted ? 'Unmute' : 'Mute'; };
+  navigator.mediaDevices.addEventListener('devicechange', () => refreshSinks(false));
+})();
+</script>
+</body>
+</html>`;
+
+// Mosaic page: ?ids=channel-179,channel-183 → grid of N <iframe>s each loading /play/<id>?embed=1.
+// Each iframe is fully independent (its own Shaka instance, its own setSinkId picker), so you can
+// route each cell's audio to a different virtual device for separate OBS captures.
+const MOSAIC_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voyo Mosaic</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 13px system-ui, -apple-system, sans-serif; }
+  .grid { display: grid; height: 100%; gap: 2px; background: #222; }
+  .grid.n1 { grid-template: 1fr / 1fr; }
+  .grid.n2 { grid-template: 1fr / 1fr 1fr; }
+  .grid.n3 { grid-template: 1fr 1fr / 1fr 1fr; }
+  .grid.n4 { grid-template: 1fr 1fr / 1fr 1fr; }
+  .grid.n5, .grid.n6 { grid-template: 1fr 1fr / 1fr 1fr 1fr; }
+  .grid.n7, .grid.n8, .grid.n9 { grid-template: 1fr 1fr 1fr / 1fr 1fr 1fr; }
+  iframe { width: 100%; height: 100%; border: 0; background: #000; }
+  .empty { padding: 40px; text-align: center; opacity: .55; }
+</style>
+</head>
+<body>
+<div id="g" class="grid n1"></div>
+<script>
+const ids = (new URLSearchParams(location.search).get('ids') || '').split(',').map(s => s.trim()).filter(Boolean);
+const g = document.getElementById('g');
+if (!ids.length) {
+  g.outerHTML = '<div class="empty">add ?ids=channel-X,channel-Y to the URL</div>';
+} else {
+  g.className = 'grid n' + Math.min(ids.length, 9);
+  g.innerHTML = ids.map(id => '<iframe src="/play/' + encodeURIComponent(id) + '?embed=1" allow="autoplay; encrypted-media; microphone"></iframe>').join('');
+}
 </script>
 </body>
 </html>`;
