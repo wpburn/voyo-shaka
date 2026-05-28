@@ -463,8 +463,9 @@ function isM3u8(url: string, contentType: string | null): boolean {
   return /\.m3u8(\?|$)/i.test(url);
 }
 
-function rewritePlaylist(body: string, baseUrl: string): string {
-  const proxy = (abs: string) => `/proxy?url=${encodeURIComponent(abs)}`;
+function rewritePlaylist(body: string, baseUrl: string, proxyOrigin = ""): string {
+  const proxyBase = `${proxyOrigin}/proxy?url=`;
+  const proxy = (abs: string) => `${proxyBase}${encodeURIComponent(abs)}`;
   return body.split(/\r?\n/).map((line) => {
     if (!line) return line;
     if (line.startsWith("#")) {
@@ -475,7 +476,22 @@ function rewritePlaylist(body: string, baseUrl: string): string {
   }).join("\n");
 }
 
-async function buildLivePlaylist(channelId: string): Promise<Response> {
+function proxyFetchHeaders(req?: Request): HeadersInit {
+  const stableUa =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+  const headers: Record<string, string> = {
+    // Upstream HLS edges vary responses by client context. Deno's default UA can produce
+    // unusable child playlists, while embedded-browser UAs (Electron/VS Code) can be rejected.
+    // Use a stable desktop Chrome UA for all upstream media fetches.
+    "User-Agent": stableUa,
+    "Accept": "*/*",
+  };
+  const range = req?.headers.get("range");
+  if (range) headers["Range"] = range;
+  return headers;
+}
+
+async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
   const info = await withAuth((t, u) => resolveStream(channelId, t, u));
   if (info.isDrm) {
     return new Response(
@@ -483,7 +499,7 @@ async function buildLivePlaylist(channelId: string): Promise<Response> {
       { status: 415 },
     );
   }
-  const masterRes = await fetch(info.url);
+  const masterRes = await fetch(info.url, { headers: proxyFetchHeaders() });
   if (!masterRes.ok) return new Response(`upstream ${masterRes.status}`, { status: masterRes.status });
   const masterBody = await masterRes.text();
   if (!masterBody.trimStart().startsWith("#EXTM3U")) {
@@ -506,13 +522,13 @@ async function buildLivePlaylist(channelId: string): Promise<Response> {
     }
     if (best) {
       baseUrl = new URL(best.uri, info.url).toString();
-      const varRes = await fetch(baseUrl);
+      const varRes = await fetch(baseUrl, { headers: proxyFetchHeaders() });
       if (!varRes.ok) return new Response(`variant ${varRes.status}`, { status: varRes.status });
       body = await varRes.text();
     }
   }
 
-  return new Response(rewritePlaylist(body, baseUrl), {
+  return new Response(rewritePlaylist(body, baseUrl, proxyOrigin), {
     headers: { "Content-Type": "application/vnd.apple.mpegurl" },
   });
 }
@@ -578,7 +594,7 @@ async function handle(req: Request): Promise<Response> {
       await getChannels();
       const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
-      return await buildLivePlaylist(ch.id);
+      return await buildLivePlaylist(ch.id, url.origin);
     } catch (e) {
       console.error(`[live] ${requested}:`, (e as Error).message);
       return new Response((e as Error).message, { status: 500 });
@@ -684,14 +700,11 @@ async function handle(req: Request): Promise<Response> {
     const target = url.searchParams.get("url");
     if (!target) return new Response("missing url", { status: 400 });
     try {
-      const upstreamHeaders: Record<string, string> = {};
-      const range = req.headers.get("range");
-      if (range) upstreamHeaders["Range"] = range;
-      const upstream = await fetch(target, { headers: upstreamHeaders });
+      const upstream = await fetch(target, { headers: proxyFetchHeaders(req) });
       const ct = upstream.headers.get("content-type");
       if (isM3u8(target, ct)) {
         const body = await upstream.text();
-        return new Response(rewritePlaylist(body, target), {
+        return new Response(rewritePlaylist(body, target, url.origin), {
           status: upstream.status,
           headers: { "Content-Type": ct ?? "application/vnd.apple.mpegurl" },
         });
@@ -847,8 +860,10 @@ const PLAY_HTML = `<!doctype html>
   .bar label { display: inline-flex; align-items: center; gap: 6px; opacity: .85; }
   .status { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; opacity: .55; }
   .status.err { color: #f88; opacity: 1; }
+  .diag { padding: 8px 10px; border-top: 1px solid #171717; background: #0b0b0b; color: #8ab4f8; font: 11px/1.45 ui-monospace, SFMono-Regular, monospace; white-space: pre-wrap; max-height: 132px; overflow: auto; }
   body.embed .bar { padding: 4px 6px; font-size: 11px; }
   body.embed .bar select, body.embed .bar button { padding: 2px 6px; font-size: 11px; }
+  body.embed .diag { padding: 6px; font-size: 10px; max-height: 96px; }
 </style>
 </head>
 <body>
@@ -861,22 +876,71 @@ const PLAY_HTML = `<!doctype html>
     <button id="mute">Unmute</button>
     <span class="status" id="status">…</span>
   </div>
+  <div class="diag" id="diag">booting…</div>
 </div>
 <script>
 (async () => {
+  const earlyDiag = document.getElementById('diag');
+  if (earlyDiag) earlyDiag.textContent = 'script started';
+  window.addEventListener('error', (ev) => {
+    if (earlyDiag) earlyDiag.textContent = 'window error: ' + (ev.message || 'unknown error');
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    const reason = ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason);
+    if (earlyDiag) earlyDiag.textContent = 'promise rejection: ' + reason;
+  });
   if (new URLSearchParams(location.search).get('embed') === '1') document.body.classList.add('embed');
-  const id = decodeURIComponent(location.pathname.replace(/^\\/play\\//, ''));
+  const playPrefix = '/play/';
+  const id = decodeURIComponent(location.pathname.startsWith(playPrefix)
+    ? location.pathname.slice(playPrefix.length)
+    : location.pathname);
   const nameEl = document.getElementById('name');
   const statusEl = document.getElementById('status');
+  const diagEl = document.getElementById('diag');
   const sinkSel = document.getElementById('sink');
   const muteBtn = document.getElementById('mute');
   const pickBtn = document.getElementById('pickAudio');
   const video = document.getElementById('v');
   const setStatus = (s, err) => { statusEl.textContent = s; statusEl.classList.toggle('err', !!err); };
+  const diagLines = [];
+  const logDiag = (s) => {
+    const line = '[' + new Date().toLocaleTimeString() + '] ' + s;
+    diagLines.push(line);
+    while (diagLines.length > 12) diagLines.shift();
+    diagEl.textContent = diagLines.join('\\n');
+    console.log('[play diag]', s);
+  };
+  const errText = (e) => {
+    if (!e) return 'unknown error';
+    if (typeof e === 'string') return e;
+    if (e.message) return e.message;
+    try { return JSON.stringify(e); } catch { return String(e); }
+  };
+  async function probeWidevine() {
+    if (!window.isSecureContext) return { ok: false, reason: 'page is not a secure context' };
+    if (typeof navigator.requestMediaKeySystemAccess !== 'function') {
+      return { ok: false, reason: 'requestMediaKeySystemAccess unavailable' };
+    }
+    try {
+      await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{
+        initDataTypes: ['cenc'],
+        audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+        videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }],
+        distinctiveIdentifier: 'optional',
+        persistentState: 'optional',
+        sessionTypes: ['temporary'],
+      }]);
+      return { ok: true, reason: 'granted' };
+    } catch (e) {
+      return { ok: false, reason: errText(e) };
+    }
+  }
 
   if (typeof shaka === 'undefined') { setStatus('shaka failed to load', true); return; }
   shaka.polyfill.installAll();
   if (!shaka.Player.isBrowserSupported()) { setStatus('browser not supported (need EME/MSE)', true); return; }
+  logDiag('origin=' + location.origin + ' secure=' + window.isSecureContext);
+  logDiag('ua=' + navigator.userAgent);
 
   setStatus('resolving…');
   let info;
@@ -887,29 +951,70 @@ const PLAY_HTML = `<!doctype html>
   } catch (e) { setStatus(e.message, true); return; }
   nameEl.textContent = info.name || id;
   document.title = (info.name || id) + ' — Voyo';
+  logDiag('manifest=' + info.manifestUrl);
+  logDiag('drm=' + !!info.licenseUrl + (info.licenseUrl ? ' license=' + info.licenseUrl : ''));
 
   const player = new shaka.Player(video);
+  let widevineProbe = null;
   if (info.licenseUrl) {
     player.configure({ drm: { servers: { 'com.widevine.alpha': info.licenseUrl } } });
+    widevineProbe = await probeWidevine();
+    logDiag('widevine probe=' + (widevineProbe.ok ? 'ok' : ('failed: ' + widevineProbe.reason)));
   }
   const ORIGIN = location.origin;
   const PROXY = ORIGIN + '/proxy?url=';
   const ne = player.getNetworkingEngine();
   ne.registerRequestFilter((type, request) => {
-    if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) return;
-    request.uris = request.uris.map(u => u.startsWith(ORIGIN) ? u : (PROXY + encodeURIComponent(u)));
+    if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
+      logDiag('license request -> ' + request.uris.join(', '));
+      return;
+    }
+    request.uris = request.uris.map((u) => {
+      if (u.startsWith(ORIGIN)) return u;
+      if (u.startsWith('/proxy?url=')) return ORIGIN + u;
+      return PROXY + encodeURIComponent(u);
+    });
   });
   ne.registerResponseFilter((type, response) => {
-    if (response.uri && response.uri.startsWith(PROXY)) response.uri = decodeURIComponent(response.uri.slice(PROXY.length));
-    if (response.originalUri && response.originalUri.startsWith(PROXY)) response.originalUri = decodeURIComponent(response.originalUri.slice(PROXY.length));
+    if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
+      logDiag('license response <- ' + (response.uri || response.originalUri || 'unknown uri'));
+    }
   });
-  player.addEventListener('error', (e) => setStatus('shaka ' + e.detail.code + ': ' + (e.detail.data && e.detail.data[0] || ''), true));
+  player.addEventListener('error', (e) => {
+    const detail = e.detail || {};
+    const extra = Array.isArray(detail.data)
+      ? detail.data.map((v) => typeof v === 'string' ? v : JSON.stringify(v)).join(' | ')
+      : '';
+    logDiag('shaka error ' + detail.code + (extra ? ': ' + extra : ''));
+    setStatus('shaka ' + detail.code + ': ' + extra, true);
+  });
 
   setStatus('loading…');
   try {
     await player.load(info.manifestUrl);
     setStatus(info.isDrm ? 'DRM playing' : 'playing');
-  } catch (e) { setStatus('load: ' + (e.message || JSON.stringify(e)), true); return; }
+    logDiag('player.load ok');
+  } catch (e) {
+    const msg = errText(e);
+    if (e && e.code === 6001) {
+      const reason = widevineProbe && !widevineProbe.ok
+        ? 'Widevine unavailable in this browser/runtime: ' + widevineProbe.reason
+        : 'Widevine key system config unavailable in this browser/runtime';
+      logDiag(reason);
+      setStatus('load: ' + reason, true);
+    } else if (e && e.code === 1001 && Array.isArray(e.data)) {
+      const uri = e.data[0] || 'unknown uri';
+      const status = e.data[1] || 'unknown status';
+      const responseText = e.data[4] || '';
+      const reason = 'HTTP failure ' + status + ' at ' + uri + (responseText ? ' :: ' + responseText : '');
+      logDiag(reason);
+      setStatus('load: ' + reason, true);
+    } else {
+      logDiag('load failed: ' + msg);
+      setStatus('load: ' + msg, true);
+    }
+    return;
+  }
 
   async function refreshSinks(prompt) {
     try {
