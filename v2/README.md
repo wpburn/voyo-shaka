@@ -53,9 +53,17 @@ Caveats: Linux targets are glibc (no musl/Alpine); the snapshot for each new tar
 
 ## DRM → VLC (server-side Widevine decrypt)
 
-VLC doesn't speak Widevine, but if you have a Widevine **L3** device file you can decrypt server-side and serve plain HLS that VLC plays directly. Capped at L3 quality (~720p on Voyo's mobile profile, which is what the headers in `voyo.ts` already pretend to be).
+VLC doesn't speak Widevine, but if you have a Widevine **L3** device file you can decrypt server-side and serve plain HLS that VLC plays directly. The `/vlc` path now uses a local multi-step pipeline:
 
-You need: `ffmpeg` on PATH, Python 3.10+, and an L3 `.wvd` device file (drop it next to the script as `l3.wvd`, or set `VOYO_CDM_DEVICE=/path/to/your.wvd`).
+1. fetch the signed DRM MPD
+2. resolve keys through `cdm.py`
+3. download rolling audio/video fragments
+4. decrypt them with `mp4decrypt`
+5. remux the local decrypted DASH view to HLS with `ffmpeg`
+
+Capped at L3 quality (~720p on Voyo's mobile profile, which is what the headers in `voyo.ts` already pretend to be).
+
+You need: `ffmpeg`, `mp4decrypt` from Bento4, Python 3.10+, and an L3 `.wvd` device file (drop it next to the script as `l3.wvd`, or set `VOYO_CDM_DEVICE=/path/to/your.wvd`).
 
 ```sh
 # one-time
@@ -86,10 +94,11 @@ Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `h
 | `VOYO_CDM_PORT` | `8091`                  | sidecar listen port |
 | `VOYO_CDM_DEVICE` | `./l3.wvd`            | path to your L3 device file |
 | `VOYO_FFMPEG`   | `ffmpeg`                | ffmpeg binary path |
+| `VOYO_MP4DECRYPT` | `mp4decrypt`          | Bento4 `mp4decrypt` binary path |
 
 **Caveats:**
 - L1 (HD/4K) is intentionally not supported — would require a rooted-Android TEE proxy, not worth the operational pain. Stick with L3.
-- `ffmpeg -decryption_key` accepts a single key. If you hit a Voyo channel with separate audio/video KIDs, swap ffmpeg for `shaka-packager` in the `startPipe` function (commented hint in `voyo.ts`).
+- `mp4decrypt` is mandatory for the current VLC DRM path. On macOS you can usually install Bento4 and then point `VOYO_MP4DECRYPT` at the binary if it is not already on `PATH`.
 - The `.wvd` file is yours to provide — none ships here. `pip install pywidevine` then `pywidevine create-device -k private_key.pem -c client_id.bin -t ANDROID -l 3 -o .` if you have separate files.
 - `live/` (transient HLS chunks) is git-ignored; it's recreated under the config dir at runtime.
 

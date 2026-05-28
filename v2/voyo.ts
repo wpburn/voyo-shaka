@@ -207,113 +207,696 @@ async function getKeys(channelId: string, force = false): Promise<ContentKey[]> 
   return keys;
 }
 
-// === FFmpeg pipe manager: spawns ffmpeg per channel, transmuxes decrypted DASH → local HLS ===
-const FFMPEG = Deno.env.get("VOYO_FFMPEG") ?? "ffmpeg";
+// === VLC DRM pipeline: fetch MPD → download fragments → decrypt with mp4decrypt → remux to HLS ===
+const MP4DECRYPT = Deno.env.get("VOYO_MP4DECRYPT") ?? "mp4decrypt";
 const LIVE_DIR = `${CONFIG_DIR}/live`;
 const PIPE_IDLE_MS = 60 * 1000;
-const PIPE_READY_TIMEOUT_MS = 20_000;
+const PIPE_SYNC_FALLBACK_MS = 3_000;
+const PIPE_SEGMENT_WINDOW = 8;
+const PIPE_SEGMENT_RETENTION = 18;
+const LOCAL_DASH_NAME = "stream.mpd";
 
+type TrackKind = "audio" | "video";
+type ParsedSegment = {
+  id: string;
+  url: string;
+  number: number | null;
+  time: number | null;
+  duration: number;
+};
+type ParsedRepresentation = {
+  kind: TrackKind;
+  representationId: string;
+  bandwidth: number;
+  codecs: string;
+  mimeType: string;
+  language?: string;
+  timescale: number;
+  initUrl: string;
+  segments: ParsedSegment[];
+};
+type ParsedMpd = {
+  minimumUpdatePeriodMs: number;
+  audio: ParsedRepresentation[];
+  video: ParsedRepresentation[];
+};
+type LocalSegment = ParsedSegment & {
+  encryptedFile: string;
+  decryptedFile: string;
+  downloadedAt: number;
+};
+type LocalTrackState = {
+  source: ParsedRepresentation;
+  initFile: string;
+  initReady: boolean;
+  segments: LocalSegment[];
+};
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
 type Pipe = {
-  proc: Deno.ChildProcess;
+  channelId: string;
   dir: string;
   ready: Promise<string>;
+  readyResolve: Deferred<string>["resolve"];
+  readyReject: Deferred<string>["reject"];
   lastAccess: number;
+  stopRequested: boolean;
+  keys: ContentKey[];
+  syncIntervalMs: number;
+  loop: Promise<void> | null;
+  audio: LocalTrackState | null;
+  video: LocalTrackState | null;
 };
 const pipes = new Map<string, Pipe>();
+let mp4decryptChecked = false;
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: Deferred<T>["resolve"];
+  let reject!: Deferred<T>["reject"];
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 async function clearDir(dir: string): Promise<void> {
   try {
     for await (const entry of Deno.readDir(dir)) {
-      await Deno.remove(`${dir}/${entry.name}`).catch(() => {});
+      await Deno.remove(`${dir}/${entry.name}`, { recursive: true }).catch(() => {});
     }
   } catch (e) {
     if (!(e instanceof Deno.errors.NotFound)) throw e;
   }
 }
 
-async function waitForPlaylist(path: string, deadline: number): Promise<string> {
-  while (Date.now() < deadline) {
-    try {
-      const st = await Deno.stat(path);
-      if (st.isFile && st.size > 0) {
-        // Also wait until at least one segment exists, so VLC doesn't hit a 404 immediately.
-        const body = await Deno.readTextFile(path);
-        if (/\.ts(\?|$|\n)/m.test(body) || /#EXT-X-ENDLIST/.test(body)) return path;
-      }
-    } catch { /* not yet */ }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  throw new Error("ffmpeg did not produce a usable playlist in time");
+function decodeXmlText(text: string): string {
+  return text
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&apos;", "'");
 }
 
-async function startPipe(channelId: string): Promise<Pipe> {
-  const dir = `${LIVE_DIR}/${channelId}`;
-  await Deno.mkdir(dir, { recursive: true });
-  await clearDir(dir);
+function escapeXml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
 
-  const info = await getStreamInfo(channelId);
-  if (!info.drm) throw new Error("channel is not DRM — use /live/<id>.m3u8");
-  const keys = await getKeys(channelId);
+function parseXmlAttributes(src: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([:\w-]+)\s*=\s*"([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    attrs[m[1]] = decodeXmlText(m[2]);
+  }
+  return attrs;
+}
 
-  // ffmpeg's `-decryption_key` accepts ONE key. Voyo live MPDs we've seen use the same KID
-  // for audio + video, so the first key works. If you hit a multi-key stream, swap to
-  // shaka-packager (commented at the bottom of this function) — it supports per-stream keys.
-  const args = [
-    "-loglevel", "warning",
-    "-allowed_extensions", "ALL",
-    "-decryption_key", keys[0].key,
-    "-i", info.url,
-    "-c", "copy",
-    "-f", "hls",
-    "-hls_time", "4",
-    "-hls_list_size", "8",
-    "-hls_flags", "delete_segments+append_list+independent_segments+omit_endlist",
-    "-hls_segment_filename", `${dir}/seg-%05d.ts`,
-    `${dir}/index.m3u8`,
-  ];
-  console.log(`[ffmpeg ${channelId}] spawning: ${FFMPEG} ${args.join(" ")}`);
-  const proc = new Deno.Command(FFMPEG, {
+function findXmlBlocks(xml: string, tag: string): Array<{ attrs: Record<string, string>; inner: string }> {
+  const blocks: Array<{ attrs: Record<string, string>; inner: string }> = [];
+  const re = new RegExp(`<${tag}\\b([^>]*?)(?:>([\\s\\S]*?)<\\/${tag}>|\\/>)`, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    blocks.push({ attrs: parseXmlAttributes(m[1]), inner: m[2] ?? "" });
+  }
+  return blocks;
+}
+
+function findXmlText(xml: string, tag: string): string | null {
+  const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i").exec(xml);
+  return m ? decodeXmlText(m[1].trim()) : null;
+}
+
+function parseIsoDurationMs(input: string | undefined): number | null {
+  if (!input) return null;
+  const m = /^P(?:([0-9.]+)D)?(?:T(?:([0-9.]+)H)?(?:([0-9.]+)M)?(?:([0-9.]+)S)?)?$/i.exec(input.trim());
+  if (!m) return null;
+  const days = Number(m[1] ?? 0);
+  const hours = Number(m[2] ?? 0);
+  const mins = Number(m[3] ?? 0);
+  const secs = Number(m[4] ?? 0);
+  return Math.round((((days * 24) + hours) * 60 + mins) * 60 * 1000 + secs * 1000);
+}
+
+function fillTemplate(
+  template: string,
+  representationId: string,
+  bandwidth: number,
+  number: number | null,
+  time: number | null,
+): string {
+  return template.replaceAll(/\$(RepresentationID|Bandwidth|Number|Time)(?:%0(\d+)d)?\$/g, (_m, token, widthRaw) => {
+    const width = Number(widthRaw ?? 0);
+    const pad = (value: string) => width > 0 ? value.padStart(width, "0") : value;
+    switch (token) {
+      case "RepresentationID":
+        return representationId;
+      case "Bandwidth":
+        return pad(String(bandwidth));
+      case "Number":
+        if (number == null) throw new Error(`template requires $Number$ but no segment number exists for ${representationId}`);
+        return pad(String(number));
+      case "Time":
+        if (time == null) throw new Error(`template requires $Time$ but no segment time exists for ${representationId}`);
+        return pad(String(time));
+      default:
+        return "";
+    }
+  });
+}
+
+function parseSegmentTimeline(inner: string): Array<{ time: number | null; duration: number; repeat: number }> {
+  const timeline: Array<{ time: number | null; duration: number; repeat: number }> = [];
+  const tlMatch = /<SegmentTimeline\b[^>]*>([\s\S]*?)<\/SegmentTimeline>/i.exec(inner);
+  if (!tlMatch) return timeline;
+  const re = /<S\b([^>]*)\/?>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(tlMatch[1])) !== null) {
+    const attrs = parseXmlAttributes(m[1]);
+    const duration = Number(attrs.d ?? "");
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+    timeline.push({
+      time: attrs.t != null ? Number(attrs.t) : null,
+      duration,
+      repeat: attrs.r != null ? Number(attrs.r) : 0,
+    });
+  }
+  return timeline;
+}
+
+function parseSegmentTemplate(xml: string): { attrs: Record<string, string>; inner: string } | null {
+  const m = /<SegmentTemplate\b([^>]*)(?:\/>|>([\s\S]*?)<\/SegmentTemplate>)/i.exec(xml);
+  if (!m) return null;
+  return { attrs: parseXmlAttributes(m[1]), inner: m[2] ?? "" };
+}
+
+function parseSegmentList(
+  xml: string,
+  representationId: string,
+  bandwidth: number,
+  baseUrl: string,
+  timescaleFallback: number,
+): { timescale: number; initUrl: string; segments: ParsedSegment[] } | null {
+  const m = /<SegmentList\b([^>]*)>([\s\S]*?)<\/SegmentList>/i.exec(xml);
+  if (!m) return null;
+  const attrs = parseXmlAttributes(m[1]);
+  const inner = m[2];
+  const initAttrs = /<Initialization\b([^>]*)\/?>/i.exec(inner)?.[1];
+  const initSource = initAttrs ? parseXmlAttributes(initAttrs).sourceURL : null;
+  if (!initSource) return null;
+  const timescale = Number(attrs.timescale ?? timescaleFallback) || timescaleFallback || 1;
+  const urls: ParsedSegment[] = [];
+  const timelineEntries = parseSegmentTimeline(inner);
+  const segUrlRe = /<SegmentURL\b([^>]*)\/?>/gi;
+  let idx = 0;
+  let segUrlMatch: RegExpExecArray | null;
+  while ((segUrlMatch = segUrlRe.exec(inner)) !== null) {
+    const segAttrs = parseXmlAttributes(segUrlMatch[1]);
+    const media = segAttrs.media;
+    if (!media) continue;
+    const tl = timelineEntries[idx];
+    urls.push({
+      id: `list-${idx}`,
+      url: new URL(media, baseUrl).toString(),
+      number: idx + 1,
+      time: tl?.time ?? null,
+      duration: tl?.duration ?? 1,
+    });
+    idx += 1;
+  }
+  return {
+    timescale,
+    initUrl: new URL(initSource, baseUrl).toString(),
+    segments: urls,
+  };
+}
+
+function buildSegmentsFromTemplate(
+  templateAttrs: Record<string, string>,
+  templateInner: string,
+  representationId: string,
+  bandwidth: number,
+  baseUrl: string,
+): { timescale: number; initUrl: string; segments: ParsedSegment[] } | null {
+  const initialization = templateAttrs.initialization;
+  const media = templateAttrs.media;
+  if (!initialization || !media) return null;
+  const timescale = Number(templateAttrs.timescale ?? "1") || 1;
+  const startNumber = Number(templateAttrs.startNumber ?? "1") || 1;
+  const initUrl = new URL(fillTemplate(initialization, representationId, bandwidth, startNumber, null), baseUrl).toString();
+  const timeline = parseSegmentTimeline(templateInner);
+  if (timeline.length === 0) return null;
+  const segments: ParsedSegment[] = [];
+  let segmentNumber = startNumber;
+  let currentTime = timeline[0]?.time ?? 0;
+  for (const entry of timeline) {
+    if (entry.time != null) currentTime = entry.time;
+    const repeat = entry.repeat < 0 ? 0 : entry.repeat;
+    for (let i = 0; i <= repeat; i++) {
+      const id = `n-${segmentNumber}`;
+      segments.push({
+        id,
+        url: new URL(fillTemplate(media, representationId, bandwidth, segmentNumber, currentTime), baseUrl).toString(),
+        number: segmentNumber,
+        time: currentTime,
+        duration: entry.duration,
+      });
+      segmentNumber += 1;
+      currentTime += entry.duration;
+    }
+  }
+  return { timescale, initUrl, segments };
+}
+
+function resolveRepresentation(
+  kind: TrackKind,
+  representation: { attrs: Record<string, string>; inner: string },
+  adaptation: { attrs: Record<string, string>; inner: string },
+  baseUrl: string,
+): ParsedRepresentation | null {
+  const repAttrs = representation.attrs;
+  const adaptAttrs = adaptation.attrs;
+  const representationId = repAttrs.id;
+  if (!representationId) return null;
+  const bandwidth = Number(repAttrs.bandwidth ?? adaptAttrs.bandwidth ?? "0") || 0;
+  const mimeType = repAttrs.mimeType ?? adaptAttrs.mimeType ?? `${kind}/mp4`;
+  const codecs = repAttrs.codecs ?? adaptAttrs.codecs ?? "";
+  const language = adaptAttrs.lang;
+  const repBase = findXmlText(representation.inner, "BaseURL") ?? "";
+  const resolvedBase = repBase ? new URL(repBase, baseUrl).toString() : baseUrl;
+
+  const repTemplate = parseSegmentTemplate(representation.inner);
+  const adaptTemplate = parseSegmentTemplate(adaptation.inner);
+  const mergedTemplateAttrs = { ...(adaptTemplate?.attrs ?? {}), ...(repTemplate?.attrs ?? {}) };
+  const templateInner = repTemplate?.inner || adaptTemplate?.inner || "";
+  const fromTemplate = Object.keys(mergedTemplateAttrs).length > 0
+    ? buildSegmentsFromTemplate(mergedTemplateAttrs, templateInner, representationId, bandwidth, resolvedBase)
+    : null;
+  const fromList = fromTemplate ??
+    parseSegmentList(
+      representation.inner,
+      representationId,
+      bandwidth,
+      resolvedBase,
+      Number(mergedTemplateAttrs.timescale ?? "1") || 1,
+    ) ??
+    parseSegmentList(
+      adaptation.inner,
+      representationId,
+      bandwidth,
+      resolvedBase,
+      Number(mergedTemplateAttrs.timescale ?? "1") || 1,
+    );
+  if (!fromList) return null;
+
+  return {
+    kind,
+    representationId,
+    bandwidth,
+    codecs,
+    mimeType,
+    language,
+    timescale: fromList.timescale,
+    initUrl: fromList.initUrl,
+    segments: fromList.segments,
+  };
+}
+
+async function parseMpd(mpdUrl: string): Promise<ParsedMpd> {
+  const res = await fetch(mpdUrl, { headers: proxyFetchHeaders() });
+  if (!res.ok) throw new HttpError(res.status, `MPD fetch: ${res.status}`);
+  const xml = await res.text();
+  const mpdOpen = /<MPD\b([^>]*)>/i.exec(xml);
+  const mpdAttrs = mpdOpen ? parseXmlAttributes(mpdOpen[1]) : {};
+  const mpdBase = findXmlText(xml, "BaseURL");
+  const baseUrl = mpdBase ? new URL(mpdBase, mpdUrl).toString() : mpdUrl;
+  const periods = findXmlBlocks(xml, "Period");
+  const period = periods[0];
+  if (!period) throw new Error("MPD has no Period");
+  const periodBase = findXmlText(period.inner, "BaseURL");
+  const resolvedPeriodBase = periodBase ? new URL(periodBase, baseUrl).toString() : baseUrl;
+
+  const audio: ParsedRepresentation[] = [];
+  const video: ParsedRepresentation[] = [];
+  for (const adaptation of findXmlBlocks(period.inner, "AdaptationSet")) {
+    const mimeType = adaptation.attrs.mimeType ?? "";
+    const contentType = adaptation.attrs.contentType ??
+      (mimeType.startsWith("audio/") ? "audio" : mimeType.startsWith("video/") ? "video" : "");
+    const kind = contentType === "audio" || contentType === "video" ? contentType : null;
+    if (!kind) continue;
+    const adaptationBase = findXmlText(adaptation.inner, "BaseURL");
+    const resolvedAdaptationBase = adaptationBase ? new URL(adaptationBase, resolvedPeriodBase).toString() : resolvedPeriodBase;
+    const representations = findXmlBlocks(adaptation.inner, "Representation");
+    if (representations.length === 0) {
+      console.log(`[mpd] ${kind} adaptation without representations: ${JSON.stringify(adaptation.attrs)}`);
+    }
+    for (const representation of representations) {
+      const parsed = resolveRepresentation(kind, representation, adaptation, resolvedAdaptationBase);
+      if (!parsed || parsed.segments.length === 0) continue;
+      (kind === "audio" ? audio : video).push(parsed);
+    }
+  }
+
+  if (audio.length === 0 || video.length === 0) {
+    console.log(`[mpd] parse result audio=${audio.length} video=${video.length} url=${mpdUrl}`);
+  }
+
+  return {
+    minimumUpdatePeriodMs: parseIsoDurationMs(mpdAttrs.minimumUpdatePeriod) ?? PIPE_SYNC_FALLBACK_MS,
+    audio,
+    video,
+  };
+}
+
+function chooseRepresentation(list: ParsedRepresentation[], preferredId?: string): ParsedRepresentation | null {
+  if (preferredId) {
+    const keep = list.find((item) => item.representationId === preferredId);
+    if (keep) return keep;
+  }
+  return [...list].sort((a, b) => b.bandwidth - a.bandwidth)[0] ?? null;
+}
+
+function mergeTrackState(kind: TrackKind, current: LocalTrackState | null, next: ParsedRepresentation): LocalTrackState {
+  if (current && current.source.representationId === next.representationId && current.source.initUrl === next.initUrl) {
+    current.source = next;
+    return current;
+  }
+  return {
+    source: next,
+    initFile: `${kind}-init.mp4`,
+    initReady: false,
+    segments: [],
+  };
+}
+
+function segmentFileStem(kind: TrackKind, segment: ParsedSegment): string {
+  if (segment.number != null) return `${kind}-n${String(segment.number).padStart(8, "0")}`;
+  return `${kind}-t${String(segment.time ?? 0).padStart(12, "0")}`;
+}
+
+async function downloadToFile(url: string, path: string): Promise<void> {
+  const res = await fetch(url, { headers: proxyFetchHeaders() });
+  if (!res.ok) throw new HttpError(res.status, `download ${res.status}: ${url}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const tmp = `${path}.tmp`;
+  await Deno.writeFile(tmp, bytes);
+  await Deno.rename(tmp, path);
+}
+
+async function ensureMp4decrypt(): Promise<void> {
+  if (mp4decryptChecked) return;
+  try {
+    await new Deno.Command(MP4DECRYPT, {
+      args: ["--version"],
+      stdin: "null",
+      stdout: "null",
+      stderr: "null",
+    }).output();
+  } catch (e) {
+    if (e instanceof Deno.errors.NotFound) {
+      throw new Error(`mp4decrypt not found: set VOYO_MP4DECRYPT or install Bento4 so "${MP4DECRYPT}" is on PATH`);
+    }
+    throw e;
+  }
+  mp4decryptChecked = true;
+}
+
+async function decryptFile(
+  inputPath: string,
+  outputPath: string,
+  keys: ContentKey[],
+  fragmentsInfoPath?: string,
+): Promise<void> {
+  const args = keys.flatMap((item) => ["--key", `${item.kid}:${item.key}`]);
+  if (fragmentsInfoPath) args.push("--fragments-info", fragmentsInfoPath);
+  args.push(inputPath, `${outputPath}.tmp`);
+  const out = await new Deno.Command(MP4DECRYPT, {
     args,
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
-  }).spawn();
+  }).output();
+  if (!out.success) {
+    const stderr = new TextDecoder().decode(out.stderr).trim();
+    throw new Error(`mp4decrypt failed for ${inputPath}: ${stderr || `exit ${out.code}`}`);
+  }
+  await Deno.rename(`${outputPath}.tmp`, outputPath);
+}
 
-  // Stream ffmpeg's stderr to our console with a channel prefix.
-  (async () => {
-    const dec = new TextDecoder();
-    for await (const chunk of proc.stderr) {
-      for (const line of dec.decode(chunk).split("\n")) {
-        if (line.trim()) console.log(`[ffmpeg ${channelId}] ${line}`);
-      }
-    }
-  })();
-  (async () => {
-    const dec = new TextDecoder();
-    for await (const chunk of proc.stdout) {
-      for (const line of dec.decode(chunk).split("\n")) {
-        if (line.trim()) console.log(`[ffmpeg ${channelId}] ${line}`);
-      }
-    }
-  })();
+async function ensureTrackInit(track: LocalTrackState, dir: string, keys: ContentKey[]): Promise<void> {
+  if (track.initReady) return;
+  const encrypted = `${dir}/${track.initFile}.enc`;
+  const decrypted = `${dir}/${track.initFile}`;
+  await downloadToFile(track.source.initUrl, encrypted);
+  await decryptFile(encrypted, decrypted, keys);
+  track.initReady = true;
+}
 
-  const ready = waitForPlaylist(`${dir}/index.m3u8`, Date.now() + PIPE_READY_TIMEOUT_MS);
-  const pipe: Pipe = { proc, dir, ready, lastAccess: Date.now() };
+async function syncTrackSegments(track: LocalTrackState, dir: string, keys: ContentKey[]): Promise<void> {
+  await ensureTrackInit(track, dir, keys);
+  const window = track.source.segments.slice(-PIPE_SEGMENT_WINDOW);
+  const keepIds = new Set(track.source.segments.slice(-PIPE_SEGMENT_RETENTION).map((segment) => segment.id));
+  const known = new Set(track.segments.map((segment) => segment.id));
+
+  for (const segment of window) {
+    if (known.has(segment.id)) continue;
+    const stem = segmentFileStem(track.source.kind, segment);
+    const encryptedFile = `${stem}.m4s.enc`;
+    const decryptedFile = `${stem}.m4s`;
+    await downloadToFile(segment.url, `${dir}/${encryptedFile}`);
+    await decryptFile(`${dir}/${encryptedFile}`, `${dir}/${decryptedFile}`, keys, `${dir}/${track.initFile}.enc`);
+    track.segments.push({ ...segment, encryptedFile, decryptedFile, downloadedAt: Date.now() });
+    known.add(segment.id);
+  }
+
+  const order = new Map(track.source.segments.map((segment, index) => [segment.id, index]));
+  const survivors: LocalSegment[] = [];
+  for (const segment of track.segments) {
+    if (keepIds.has(segment.id)) {
+      survivors.push(segment);
+      continue;
+    }
+    await Deno.remove(`${dir}/${segment.encryptedFile}`).catch(() => {});
+    await Deno.remove(`${dir}/${segment.decryptedFile}`).catch(() => {});
+  }
+  survivors.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  track.segments = survivors;
+}
+
+function isExpiredStreamError(error: unknown): boolean {
+  return error instanceof HttpError && (error.status === 401 || error.status === 403);
+}
+
+async function refreshPipeState(pipe: Pipe, force = false): Promise<void> {
+  const info = await getStreamInfo(pipe.channelId, force);
+  if (!info.drm) throw new Error("channel is not DRM — use /live/<id>.m3u8");
+  const mpd = await parseMpd(info.url);
+  const video = chooseRepresentation(mpd.video, pipe.video?.source.representationId);
+  const audio = chooseRepresentation(mpd.audio, pipe.audio?.source.representationId);
+  if (!video || !audio) throw new Error("MPD did not expose both audio and video representations");
+  pipe.video = mergeTrackState("video", pipe.video, video);
+  pipe.audio = mergeTrackState("audio", pipe.audio, audio);
+  pipe.syncIntervalMs = Math.max(1_000, mpd.minimumUpdatePeriodMs);
+}
+
+async function syncPipeOnce(pipe: Pipe): Promise<void> {
+  try {
+    await refreshPipeState(pipe);
+    if (!pipe.video || !pipe.audio) throw new Error("pipe not initialized");
+    await syncTrackSegments(pipe.video, pipe.dir, pipe.keys);
+    await syncTrackSegments(pipe.audio, pipe.dir, pipe.keys);
+  } catch (error) {
+    if (!isExpiredStreamError(error)) throw error;
+    console.log(`[pipe ${pipe.channelId}] stream URL expired — refreshing signed manifest`);
+    await refreshPipeState(pipe, true);
+    if (!pipe.video || !pipe.audio) throw new Error("pipe not initialized after refresh");
+    await syncTrackSegments(pipe.video, pipe.dir, pipe.keys);
+    await syncTrackSegments(pipe.audio, pipe.dir, pipe.keys);
+  }
+}
+
+function pipeHasPlayableDash(pipe: Pipe): boolean {
+  return !!(
+    pipe.audio?.initReady &&
+    pipe.video?.initReady &&
+    (pipe.audio.segments.length ?? 0) > 1 &&
+    (pipe.video.segments.length ?? 0) > 1
+  );
+}
+
+function renderTrackManifest(track: LocalTrackState, adaptationId: string): string {
+  const lang = track.source.language ? ` lang="${escapeXml(track.source.language)}"` : "";
+  const timeline = track.segments.map((segment) => {
+    const t = segment.time != null ? ` t="${segment.time}"` : "";
+    return `            <S${t} d="${segment.duration}" />`;
+  }).join("\n");
+  const segmentUrls = track.segments.map((segment) => `          <SegmentURL media="${escapeXml(segment.decryptedFile)}" />`).join("\n");
+  return [
+    `    <AdaptationSet id="${adaptationId}" contentType="${track.source.kind}" mimeType="${escapeXml(track.source.mimeType)}"${lang} segmentAlignment="true">`,
+    `      <Representation id="${escapeXml(track.source.representationId)}" bandwidth="${track.source.bandwidth}" codecs="${escapeXml(track.source.codecs)}">`,
+    `        <SegmentList timescale="${track.source.timescale}">`,
+    `          <Initialization sourceURL="${escapeXml(track.initFile)}" />`,
+    `          <SegmentTimeline>`,
+    timeline,
+    `          </SegmentTimeline>`,
+    segmentUrls,
+    `        </SegmentList>`,
+    `      </Representation>`,
+    `    </AdaptationSet>`,
+  ].join("\n");
+}
+
+function buildLocalDashManifest(pipe: Pipe): string {
+  if (!pipe.audio || !pipe.video || !pipeHasPlayableDash(pipe)) {
+    throw new Error("local DASH manifest is not ready yet");
+  }
+  const minUpdate = Math.max(1, Math.round(pipe.syncIntervalMs / 1000));
+  return [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" minimumUpdatePeriod="PT${minUpdate}S" profiles="urn:mpeg:dash:profile:isoff-live:2011">`,
+    `  <Period id="p0" start="PT0S">`,
+    renderTrackManifest(pipe.video, "video"),
+    renderTrackManifest(pipe.audio, "audio"),
+    `  </Period>`,
+    `</MPD>`,
+  ].join("\n");
+}
+
+async function writeLocalDashManifest(pipe: Pipe): Promise<void> {
+  const manifest = buildLocalDashManifest(pipe);
+  const path = `${pipe.dir}/${LOCAL_DASH_NAME}`;
+  const tmp = `${path}.tmp`;
+  await Deno.writeTextFile(tmp, manifest);
+  await Deno.rename(tmp, path);
+}
+
+function playlistPath(dir: string, name: string): string {
+  return `${dir}/${name}`;
+}
+
+function segmentDurationSeconds(track: LocalTrackState, segment: LocalSegment): number {
+  return segment.duration / track.source.timescale;
+}
+
+function buildTrackPlaylist(track: LocalTrackState): string {
+  const targetDuration = Math.max(
+    1,
+    Math.ceil(Math.max(...track.segments.map((segment) => segmentDurationSeconds(track, segment)))),
+  );
+  const mediaSequence = track.segments[0]?.number ?? 0;
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    `#EXT-X-TARGETDURATION:${targetDuration}`,
+    `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`,
+    `#EXT-X-MAP:URI="${track.initFile}"`,
+  ];
+  for (const segment of track.segments) {
+    lines.push(`#EXTINF:${segmentDurationSeconds(track, segment).toFixed(3)},`);
+    lines.push(segment.decryptedFile);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function buildMasterPlaylist(pipe: Pipe): string {
+  if (!pipe.audio || !pipe.video) throw new Error("pipe not initialized");
+  const audioLang = pipe.audio.source.language ?? "und";
+  const combinedBandwidth = pipe.audio.source.bandwidth + pipe.video.source.bandwidth;
+  const codecs = [pipe.video.source.codecs, pipe.audio.source.codecs].filter(Boolean).join(",");
+  return [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-INDEPENDENT-SEGMENTS",
+    `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${audioLang}",LANGUAGE="${audioLang}",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"`,
+    `#EXT-X-STREAM-INF:BANDWIDTH=${combinedBandwidth},CODECS="${codecs}",AUDIO="audio"`,
+    "video.m3u8",
+  ].join("\n") + "\n";
+}
+
+async function writeTextFileAtomic(path: string, body: string): Promise<void> {
+  const tmp = `${path}.tmp`;
+  await Deno.writeTextFile(tmp, body);
+  await Deno.rename(tmp, path);
+}
+
+async function writeLocalHlsPlaylists(pipe: Pipe): Promise<void> {
+  if (!pipe.audio || !pipe.video || !pipeHasPlayableDash(pipe)) {
+    throw new Error("local HLS playlists are not ready yet");
+  }
+  await writeTextFileAtomic(playlistPath(pipe.dir, "audio.m3u8"), buildTrackPlaylist(pipe.audio));
+  await writeTextFileAtomic(playlistPath(pipe.dir, "video.m3u8"), buildTrackPlaylist(pipe.video));
+  await writeTextFileAtomic(playlistPath(pipe.dir, "index.m3u8"), buildMasterPlaylist(pipe));
+}
+
+async function runPipeLoop(pipe: Pipe): Promise<void> {
+  while (!pipe.stopRequested) {
+    try {
+      await syncPipeOnce(pipe);
+      if (pipeHasPlayableDash(pipe)) {
+        await writeLocalDashManifest(pipe);
+        await writeLocalHlsPlaylists(pipe);
+      }
+    } catch (e) {
+      console.error(`[pipe ${pipe.channelId}] sync failed: ${(e as Error).message}`);
+    }
+    await new Promise((r) => setTimeout(r, pipe.syncIntervalMs));
+  }
+}
+
+async function stopPipe(channelId: string, reason: string): Promise<void> {
+  const pipe = pipes.get(channelId);
+  if (!pipe) return;
+  console.log(`[pipe ${channelId}] ${reason}`);
+  pipe.stopRequested = true;
+  pipes.delete(channelId);
+  pipe.readyReject(new Error(reason));
+}
+
+async function startPipe(channelId: string): Promise<Pipe> {
+  await ensureMp4decrypt();
+  const dir = `${LIVE_DIR}/${channelId}`;
+  await Deno.mkdir(dir, { recursive: true });
+  await clearDir(dir);
+
+  const ready = deferred<string>();
+  const pipe: Pipe = {
+    channelId,
+    dir,
+    ready: ready.promise,
+    readyResolve: ready.resolve,
+    readyReject: ready.reject,
+    lastAccess: Date.now(),
+    stopRequested: false,
+    keys: await getKeys(channelId),
+    syncIntervalMs: PIPE_SYNC_FALLBACK_MS,
+    loop: null,
+    audio: null,
+    video: null,
+  };
   pipes.set(channelId, pipe);
 
-  proc.status.then((s) => {
-    console.log(`[ffmpeg ${channelId}] exited code=${s.code} signal=${s.signal}`);
-    if (pipes.get(channelId) === pipe) pipes.delete(channelId);
-  });
-
-  // If ffmpeg never produces a playlist, surface the failure and kill the process.
-  ready.catch((e) => {
-    console.error(`[ffmpeg ${channelId}] ${(e as Error).message} — killing`);
-    try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-    if (pipes.get(channelId) === pipe) pipes.delete(channelId);
-  });
-
-  return pipe;
+  try {
+    await syncPipeOnce(pipe);
+    if (!pipeHasPlayableDash(pipe)) throw new Error("not enough decrypted fragments to start remuxing");
+    await writeLocalDashManifest(pipe);
+    await writeLocalHlsPlaylists(pipe);
+    pipe.loop = runPipeLoop(pipe);
+    pipe.readyResolve(`${dir}/index.m3u8`);
+    return pipe;
+  } catch (e) {
+    pipes.delete(channelId);
+    await clearDir(dir).catch(() => {});
+    pipe.readyReject(e);
+    throw e;
+  }
 }
 
 async function ensurePipe(channelId: string): Promise<string> {
@@ -329,14 +912,11 @@ async function ensurePipe(channelId: string): Promise<string> {
   return pipe.dir;
 }
 
-// Periodic sweep: kill ffmpegs that haven't been touched for a while.
 setInterval(() => {
   const now = Date.now();
-  for (const [id, p] of pipes) {
-    if (now - p.lastAccess > PIPE_IDLE_MS) {
-      console.log(`[pipe ${id}] idle ${Math.round((now - p.lastAccess) / 1000)}s — killing ffmpeg`);
-      try { p.proc.kill("SIGTERM"); } catch { /* ignore */ }
-      pipes.delete(id);
+  for (const [id, pipe] of pipes) {
+    if (now - pipe.lastAccess > PIPE_IDLE_MS) {
+      void stopPipe(id, `idle ${Math.round((now - pipe.lastAccess) / 1000)}s — stopping pipeline`);
     }
   }
 }, 15_000);
@@ -344,7 +924,6 @@ setInterval(() => {
 async function serveLiveFile(channelId: string, filename: string): Promise<Response> {
   const pipe = pipes.get(channelId);
   if (pipe) pipe.lastAccess = Date.now();
-  // Reject path traversal.
   if (filename.includes("/") || filename.includes("..")) {
     return new Response("bad path", { status: 400 });
   }
@@ -353,6 +932,8 @@ async function serveLiveFile(channelId: string, filename: string): Promise<Respo
     const f = await Deno.open(path, { read: true });
     const ct = filename.endsWith(".m3u8")
       ? "application/vnd.apple.mpegurl"
+      : filename.endsWith(".mpd")
+      ? "application/dash+xml"
       : filename.endsWith(".ts")
       ? "video/mp2t"
       : filename.endsWith(".m4s") || filename.endsWith(".mp4")
@@ -615,8 +1196,8 @@ async function handle(req: Request): Promise<Response> {
     }
   }
 
-  // Server-decrypted HLS for VLC / IPTV apps. /vlc/<id>/index.m3u8 is the playlist,
-  // segments are siblings (relative URIs in the playlist resolve under /vlc/<id>/).
+  // Server-decrypted HLS for VLC / IPTV apps. /vlc/<id>/index.m3u8 is the public playlist,
+  // and sibling files in the working directory hold the decrypted local DASH view.
   if (method === "GET" && path.startsWith("/vlc/")) {
     const rest = path.slice("/vlc/".length);
     const slash = rest.indexOf("/");
@@ -632,7 +1213,8 @@ async function handle(req: Request): Promise<Response> {
       await getChannels();
       const ch = config.channels.find((c) => c.id === requested || c.slug === requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
-      // Only the playlist request triggers ffmpeg startup; segment requests just read files.
+      // Only the playlist request triggers the pipeline startup; manifest and segment requests
+      // are served from the existing per-channel working directory.
       if (filename === "index.m3u8") await ensurePipe(ch.id);
       return await serveLiveFile(ch.id, filename);
     } catch (e) {
