@@ -1,0 +1,14 @@
+{
+  "auth": {
+    "username": "",
+    "password": "",
+    "authTokens": [],
+    "lastupdated": null
+  },
+  "config": {
+    "url_cache_enabled": true,
+    "url_update_interval": 4,
+    "auth_update_interval": 6,
+    "chList": {}
+  }
+}

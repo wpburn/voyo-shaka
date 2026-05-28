@@ -1,0 +1,13 @@
+node_modules
+.vscode
+yarn*
+**/*.json
+cache*
+test*
+*.realm*
+**/*.js.map
+**/*.js
+logs
+*.pem
+*.key
+*.crt

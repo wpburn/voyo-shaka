@@ -1,0 +1,27 @@
+version: "3"
+
+services:
+  iptv_ro:
+    container_name: iptvro
+    image: ghcr.io/rednblkx/iptvro_v2:main
+    init: true
+    restart: unless-stopped
+    environment:
+      - CACHE_MAX_ENTRIES=${CACHE_MAX_ENTRIES:-2000}
+    ports:
+      - "${HOST_PORT:-8090}:3000"
+    volumes:
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "deno",
+          "eval",
+          "const r = await fetch('http://127.0.0.1:3000/modules'); if (!r.ok) Deno.exit(1);",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
