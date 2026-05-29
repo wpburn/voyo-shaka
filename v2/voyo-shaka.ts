@@ -83,6 +83,7 @@ const CHANNELS_REFRESH_MS = 12 * 60 * 60 * 1000;
 const SALT_B64 = "ZGtkZjM1ZzYhIHtjb250ZW50fXxwbGF5c3xuZzhyNWUzMSF8e3NlcnZlclRpbWV9ISNpM2R0JjQzQA==";
 const UI_BASIC_AUTH_USER = Deno.env.get("VOYO_UI_BASIC_AUTH_USER") ?? "adm";
 const UI_BASIC_AUTH_PASS = Deno.env.get("VOYO_UI_BASIC_AUTH_PASS") ?? "fvoyo";
+const PRESERVE_LIVE_DIR = /^(1|true|yes)$/i.test(Deno.env.get("VOYO_PRESERVE_LIVE_DIR") ?? "");
 
 function deviceHeaders(uuid: string, token?: string): Record<string, string> {
   const h: Record<string, string> = {
@@ -116,6 +117,12 @@ function slugify(name: string): string {
 class HttpError extends Error {
   constructor(public status: number, message: string) {
     super(message);
+  }
+}
+
+class RestartCooldownError extends HttpError {
+  constructor(public retryAfterSec: number, message: string) {
+    super(503, message);
   }
 }
 
@@ -388,8 +395,8 @@ async function probeStreamKind(
   }
 }
 
-// === Stream info cache (signed URLs expire; ~30 min is safe) ===
-const STREAM_TTL_MS = 30 * 60 * 1000;
+// === Stream info cache (signed URLs expire; keep live playback fresh) ===
+const STREAM_TTL_MS = 5 * 60 * 1000;
 const streamCache = new Map<string, { info: StreamInfo; expiresAt: number }>();
 
 async function getStreamInfo(cacheKey: string, force = false, contentId = cacheKey): Promise<StreamInfo> {
@@ -470,6 +477,12 @@ const SHAKA_SEGMENT_DURATION = 6;
 const SHAKA_LIVE_WINDOW = 30;
 const SHAKA_PRESERVED_SEGMENTS = 6;
 const PLAYLIST_WAIT_TIMEOUT_MS = 25_000;
+const PIPE_NO_PROGRESS_MS = 60 * 1000;
+const PIPE_RETRY_DELAYS_MS = [3_000, 6_000, 12_000] as const;
+const PIPE_RETRY_CAP_MS = 20_000;
+const PIPE_RETRY_JITTER_RATIO = 0.2;
+const DRM_RESTART_COOLDOWN_MS = [10_000, 10_000, 20_000, 20_000, 30_000, 60_000, 60_000, 120_000, 240_000, 300_000] as const;
+const DRM_RESTART_COOLDOWN_CAP_MS = 300_000;
 
 type TrackKind = "audio" | "video";
 type ParsedSegment = {
@@ -556,6 +569,10 @@ type DrmChannelState = {
   manifest: ParsedMpd | null;
   manifestXml: string | null;
   syncIntervalMs: number;
+  consecutiveFailures: number;
+  lastProgressAt: number;
+  lastAttemptAt: number;
+  nextRetryDelayMs: number;
   downloadLoopState: "starting" | "running" | "error" | "stopped";
   loop: Promise<void> | null;
   packager: PackagerHandle | null;
@@ -566,6 +583,8 @@ type DrmChannelState = {
 };
 
 const drmStates = new Map<string, DrmChannelState>();
+const drmStateStarts = new Map<string, Promise<DrmChannelState>>();
+const drmRestartCooldowns = new Map<string, { failures: number; retryAfterAt: number; lastReason: string; updatedAt: number }>();
 let mp4decryptChecked = false;
 let shakaPackagerChecked = false;
 let cdmReachableChecked = false;
@@ -582,6 +601,69 @@ function deferred<T>(): Deferred<T> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitterDelayMs(baseMs: number): number {
+  const jitter = (Math.random() * 2 - 1) * PIPE_RETRY_JITTER_RATIO;
+  return Math.max(1_000, Math.round(baseMs * (1 + jitter)));
+}
+
+function retryDelayMsForFailures(failures: number): number {
+  const base = PIPE_RETRY_DELAYS_MS[failures - 1] ?? PIPE_RETRY_CAP_MS;
+  return Math.min(PIPE_RETRY_CAP_MS, jitterDelayMs(base));
+}
+
+function restartCooldownMsForFailures(failures: number): number {
+  return DRM_RESTART_COOLDOWN_MS[failures - 1] ?? DRM_RESTART_COOLDOWN_CAP_MS;
+}
+
+function recordRestartCooldown(channelId: string, reason: string): { failures: number; retryAfterAt: number } {
+  const current = drmRestartCooldowns.get(channelId);
+  const failures = (current?.failures ?? 0) + 1;
+  const retryAfterAt = Date.now() + restartCooldownMsForFailures(failures);
+  drmRestartCooldowns.set(channelId, { failures, retryAfterAt, lastReason: reason, updatedAt: Date.now() });
+  return { failures, retryAfterAt };
+}
+
+function clearRestartCooldown(channelId: string): void {
+  drmRestartCooldowns.delete(channelId);
+}
+
+function getRestartCooldown(channelId: string): { failures: number; retryAfterAt: number; lastReason: string; updatedAt: number } | null {
+  const entry = drmRestartCooldowns.get(channelId);
+  if (!entry) return null;
+  if (entry.retryAfterAt <= Date.now()) return entry;
+  return entry;
+}
+
+function enforceRestartCooldown(channelId: string): void {
+  const cooldown = drmRestartCooldowns.get(channelId);
+  if (!cooldown) return;
+  const remainingMs = cooldown.retryAfterAt - Date.now();
+  if (remainingMs <= 0) return;
+  const retryAfterSec = Math.max(1, Math.ceil(remainingMs / 1000));
+  throw new RestartCooldownError(
+    retryAfterSec,
+    `restart cooldown active for ${channelId}; retry after ${retryAfterSec}s (${cooldown.lastReason})`,
+  );
+}
+
+function responseForError(error: unknown, fallbackStatus = 500, asJson = false): Response {
+  if (error instanceof RestartCooldownError) {
+    const headers = { "Retry-After": String(error.retryAfterSec) };
+    return asJson
+      ? Response.json({ error: error.message, retryAfterSec: error.retryAfterSec }, { status: error.status, headers })
+      : new Response(error.message, { status: error.status, headers });
+  }
+  if (error instanceof HttpError) {
+    return asJson
+      ? Response.json({ error: error.message }, { status: error.status })
+      : new Response(error.message, { status: error.status });
+  }
+  const message = (error as Error).message;
+  return asJson
+    ? Response.json({ error: message }, { status: fallbackStatus })
+    : new Response(message, { status: fallbackStatus });
 }
 
 async function clearDir(dir: string): Promise<void> {
@@ -1061,11 +1143,12 @@ async function refreshDrmState(state: DrmChannelState, force = false): Promise<v
   state.lastRefreshAt = Date.now();
 }
 
-async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): Promise<void> {
+async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): Promise<boolean> {
   await ensureTrackInitPrepared(state, track);
   const desired = track.source.segments.slice(-PIPE_SEGMENT_WINDOW);
   const keepIds = new Set(track.source.segments.slice(-PIPE_SEGMENT_RETENTION).map((segment) => segment.id));
   const knownIds = new Set(track.segments.map((segment) => segment.id));
+  let madeProgress = false;
 
   for (const segment of desired) {
     if (knownIds.has(segment.id)) continue;
@@ -1082,6 +1165,8 @@ async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): P
       writtenAt: null,
     });
     knownIds.add(segment.id);
+    state.lastProgressAt = Date.now();
+    madeProgress = true;
   }
 
   const order = new Map(track.source.segments.map((segment, index) => [segment.id, index]));
@@ -1096,6 +1181,7 @@ async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): P
   }
   survivors.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
   track.segments = survivors;
+  return madeProgress;
 }
 
 async function writeFileToWriter(path: string, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
@@ -1218,7 +1304,7 @@ function outputPathFor(state: DrmChannelState, relativePath: string): string | n
   return `${state.dirs.out}/${clean.join("/")}`;
 }
 
-async function syncDrmStateOnce(state: DrmChannelState): Promise<void> {
+async function syncDrmStateOnce(state: DrmChannelState): Promise<boolean> {
   try {
     await refreshDrmState(state);
   } catch (error) {
@@ -1229,10 +1315,11 @@ async function syncDrmStateOnce(state: DrmChannelState): Promise<void> {
   if (!state.audio || !state.video || !state.audioWriter || !state.videoWriter) {
     throw new Error("DRM state is not fully initialized");
   }
-  await syncTrackSegments(state, state.audio);
-  await syncTrackSegments(state, state.video);
+  const audioProgress = await syncTrackSegments(state, state.audio);
+  const videoProgress = await syncTrackSegments(state, state.video);
   await feedTrack(state, state.audio, state.audioWriter);
   await feedTrack(state, state.video, state.videoWriter);
+  return audioProgress || videoProgress;
 }
 
 async function disposeState(state: DrmChannelState, reason: string, cleanupDir = true): Promise<void> {
@@ -1267,37 +1354,65 @@ async function disposeState(state: DrmChannelState, reason: string, cleanupDir =
   if (cleanupDir) await Deno.remove(state.workDir, { recursive: true }).catch(() => {});
 }
 
+async function disposeAllDrmStates(reason: string, cleanupDir = true): Promise<void> {
+  const states = [...drmStates.values()];
+  await Promise.all(states.map((state) => disposeState(state, reason, cleanupDir).catch(() => {})));
+}
+
 async function runDrmLoop(state: DrmChannelState): Promise<void> {
   while (!state.stopRequested) {
+    state.lastAttemptAt = Date.now();
     try {
       state.downloadLoopState = "running";
-      await syncDrmStateOnce(state);
+      const madeProgress = await syncDrmStateOnce(state);
+      state.consecutiveFailures = 0;
+      state.lastError = null;
+      state.nextRetryDelayMs = state.syncIntervalMs;
+      clearRestartCooldown(state.channelId);
       const playlistPath = outputPathFor(state, "index.m3u8");
       if (playlistPath && !state.readySettled && await exists(playlistPath)) {
         resolveStateReady(state, playlistPath);
+      }
+      if (!madeProgress && Date.now() - state.lastProgressAt > PIPE_NO_PROGRESS_MS) {
+        recordRestartCooldown(state.channelId, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+        await disposeState(state, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+        return;
       }
     } catch (e) {
       state.downloadLoopState = "error";
       state.lastError = (e as Error).message;
       await logState(state, `sync failed: ${state.lastError}`);
       if (!state.readySettled) {
+        recordRestartCooldown(state.channelId, state.lastError);
         await disposeState(state, state.lastError);
         return;
       }
       if (/rebuild required|packager exited|Broken pipe|closed/i.test(state.lastError)) {
+        recordRestartCooldown(state.channelId, state.lastError);
         await disposeState(state, state.lastError);
         return;
       }
+      if (Date.now() - state.lastProgressAt > PIPE_NO_PROGRESS_MS) {
+        recordRestartCooldown(state.channelId, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+        await disposeState(state, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+        return;
+      }
+      state.consecutiveFailures += 1;
+      state.nextRetryDelayMs = retryDelayMsForFailures(state.consecutiveFailures);
+      await logState(state, `retrying in ${state.nextRetryDelayMs}ms after failure ${state.consecutiveFailures}`);
+      await sleep(state.nextRetryDelayMs);
+      continue;
     }
     await sleep(state.syncIntervalMs);
   }
 }
 
-async function startDrmState(channelId: string): Promise<DrmChannelState> {
+async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string): Promise<DrmChannelState> {
   await ensureMp4decrypt();
   await ensureShakaPackager();
   await ensureCdmHealthy();
-  const entry = findChannel(channelId);
+  const entry = typeof channel === "string" ? resolveRequestedChannel(channel) : channel;
+  const channelId = typeof channel === "string" ? entry?.id ?? channel : channel.id;
   const resolvedContentId = contentIdFor(entry ?? channelId);
 
   const workDir = `${LIVE_DIR}/${channelId}`;
@@ -1337,6 +1452,10 @@ async function startDrmState(channelId: string): Promise<DrmChannelState> {
     manifest: null,
     manifestXml: null,
     syncIntervalMs: PIPE_SYNC_FALLBACK_MS,
+    consecutiveFailures: 0,
+    lastProgressAt: Date.now(),
+    lastAttemptAt: 0,
+    nextRetryDelayMs: PIPE_SYNC_FALLBACK_MS,
     downloadLoopState: "starting",
     loop: null,
     packager: null,
@@ -1351,28 +1470,47 @@ async function startDrmState(channelId: string): Promise<DrmChannelState> {
     await logState(state, "starting DRM pipeline");
     await refreshDrmState(state);
     await startPackager(state);
+    state.lastAttemptAt = Date.now();
     await syncDrmStateOnce(state);
+    state.lastError = null;
+    state.nextRetryDelayMs = state.syncIntervalMs;
+    clearRestartCooldown(channelId);
     await waitForNonEmptyFile(`${state.dirs.out}/index.m3u8`, PLAYLIST_WAIT_TIMEOUT_MS);
     resolveStateReady(state, `${state.dirs.out}/index.m3u8`);
     state.loop = runDrmLoop(state);
     return state;
   } catch (e) {
+    recordRestartCooldown(channelId, (e as Error).message);
     await disposeState(state, (e as Error).message);
     throw e;
   }
 }
 
 async function ensureDrmState(channelId: string): Promise<DrmChannelState> {
-  const existing = drmStates.get(channelId);
+  const entry = resolveRequestedChannel(channelId);
+  const resolvedId = entry?.id ?? channelId;
+  enforceRestartCooldown(resolvedId);
+  const existing = drmStates.get(resolvedId);
   if (existing) {
     existing.lastAccess = Date.now();
     await existing.ready;
     return existing;
   }
-  const state = await startDrmState(channelId);
-  await state.ready;
-  state.lastAccess = Date.now();
-  return state;
+  const pending = drmStateStarts.get(resolvedId);
+  if (pending) {
+    const state = await pending;
+    state.lastAccess = Date.now();
+    return state;
+  }
+  const startPromise = startDrmState(entry ?? channelId);
+  drmStateStarts.set(resolvedId, startPromise);
+  try {
+    const state = await startPromise;
+    state.lastAccess = Date.now();
+    return state;
+  } finally {
+    drmStateStarts.delete(resolvedId);
+  }
 }
 
 setInterval(() => {
@@ -1638,6 +1776,7 @@ async function removeManualEvent(requested: string): Promise<boolean> {
   config.manualEvents = config.manualEvents.filter((entry) => entry.id !== existing.id);
   streamCache.delete(existing.id);
   keyCache.delete(existing.id);
+  clearRestartCooldown(existing.id);
   const state = drmStates.get(existing.id);
   if (state) await disposeState(state, "manual event removed");
   await saveConfig();
@@ -1706,8 +1845,8 @@ function proxyFetchHeaders(req?: Request): HeadersInit {
 }
 
 async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
-  const entry = findChannel(channelId);
-  const info = await getStreamInfo(channelId, false, contentIdFor(entry ?? channelId));
+  const entry = resolveRequestedChannel(channelId);
+  const info = await getStreamInfo(entry?.id ?? channelId, false, contentIdFor(entry ?? channelId));
   if (info.isDrm) {
     return new Response(
       `channel ${channelId} is DRM (DASH+Widevine); open /play/${channelId} in Chrome instead`,
@@ -1758,6 +1897,28 @@ function findChannel(requested: string): Channel | undefined {
     contentRouteAliases(channel).includes(decodedRequested) ||
     (!!normalizedRequested && contentIdFor(channel) === normalizedRequested)
   );
+}
+
+function resolveRequestedChannel(requested: string): Channel | undefined {
+  const existing = findChannel(requested);
+  if (existing) return existing;
+
+  const decodedRequested = decodeURIComponent(requested).trim();
+  const normalizedRequested = normalizeRequestedContentKey(decodedRequested);
+  const transientValue = normalizeTypedContentId(normalizedRequested) ?? (/^\d+$/.test(decodedRequested) ? decodedRequested : null);
+  if (transientValue) {
+    try {
+      return parseManualEventInput(transientValue);
+    } catch {
+      // Fall through to URL parsing.
+    }
+  }
+
+  try {
+    return parseManualEventInput(decodedRequested);
+  } catch {
+    return undefined;
+  }
 }
 
 function serializeTrackState(track: TrackRuntime | null) {
@@ -1873,7 +2034,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/live/".length, -".m3u8".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
       return await buildLivePlaylist(ch.id, url.origin);
     } catch (e) {
@@ -1887,7 +2048,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/keys/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
       const keys = await getKeys(ch.id, url.searchParams.get("force") === "1", contentIdFor(ch));
       return Response.json(keys);
@@ -1900,12 +2061,22 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/drm-state/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
       if (url.searchParams.get("ensure") === "1") await ensureDrmState(ch.id);
       const state = drmStates.get(ch.id);
+      const restartCooldown = getRestartCooldown(ch.id);
       return Response.json({
         active: !!state,
+        restartCooldown: restartCooldown
+          ? {
+            failures: restartCooldown.failures,
+            retryAfterAt: new Date(restartCooldown.retryAfterAt).toISOString(),
+            retryAfterSec: Math.max(0, Math.ceil((restartCooldown.retryAfterAt - Date.now()) / 1000)),
+            lastReason: restartCooldown.lastReason,
+            updatedAt: new Date(restartCooldown.updatedAt).toISOString(),
+          }
+          : null,
         state: state
           ? {
             channelId: state.channelId,
@@ -1916,6 +2087,9 @@ async function handle(req: Request): Promise<Response> {
             lastError: state.lastError,
             downloadLoopState: state.downloadLoopState,
             syncIntervalMs: state.syncIntervalMs,
+            consecutiveFailures: state.consecutiveFailures,
+            lastProgressAt: new Date(state.lastProgressAt).toISOString(),
+            nextRetryDelayMs: state.nextRetryDelayMs,
             streamInfo: state.streamInfo
               ? {
                 url: state.streamInfo.url,
@@ -1931,7 +2105,7 @@ async function handle(req: Request): Promise<Response> {
           : null,
       });
     } catch (e) {
-      return Response.json({ error: (e as Error).message }, { status: 500 });
+      return responseForError(e, 500, true);
     }
   }
 
@@ -1939,7 +2113,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/drm-manifest/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
       const state = drmStates.get(ch.id);
       if (state?.manifestXml && url.searchParams.get("force") !== "1") {
@@ -1968,7 +2142,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/drm-log/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
       const kind = url.searchParams.get("file") ?? "pipeline";
       const workDir = `${LIVE_DIR}/${ch.id}`;
@@ -2002,13 +2176,13 @@ async function handle(req: Request): Promise<Response> {
     const filename = (typedRoute ? parts.slice(2) : parts.slice(1)).join("/");
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
       if (filename === "index.m3u8") await ensureDrmState(ch.id);
       return await serveDrmOutputFile(ch.id, filename);
     } catch (e) {
       console.error(`[vlc] ${requested}/${filename}:`, (e as Error).message);
-      return new Response((e as Error).message, { status: 500 });
+      return responseForError(e);
     }
   }
 
@@ -2018,7 +2192,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/stream/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
       const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
       return Response.json({
@@ -2030,7 +2204,8 @@ async function handle(req: Request): Promise<Response> {
         licenseUrl: info.drm ? `/license/${publicRoutePathFor(ch)}` : null,
       });
     } catch (e) {
-      streamCache.delete(requested);
+      const ch = resolveRequestedChannel(requested);
+      streamCache.delete(ch?.id ?? requested);
       return Response.json({ error: (e as Error).message }, { status: 500 });
     }
   }
@@ -2041,7 +2216,7 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/license/".length));
     try {
       await getChannels();
-      const ch = findChannel(requested);
+      const ch = resolveRequestedChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
       let info = await getStreamInfo(ch.id, false, contentIdFor(ch));
       if (!info.drm) return new Response(`channel ${requested} is not DRM`, { status: 400 });
@@ -2541,8 +2716,34 @@ if (!ids.length) {
   await ensureShakaPackager();
   console.log(`Voyo v2 Shaka → http://localhost:${PORT}`);
   console.log(`UI Basic Auth → ${UI_BASIC_AUTH_USER}:${UI_BASIC_AUTH_PASS}`);
+  console.log(`Live dir cleanup on shutdown → ${PRESERVE_LIVE_DIR ? "preserve" : "delete"}`);
   if (!config.credentials.username) {
     console.log(`⚠  add credentials to ${CONFIG_PATH} then restart`);
   }
-  Deno.serve({ port: PORT }, handle);
+  const shutdownController = new AbortController();
+  let shuttingDown: Promise<void> | null = null;
+  const gracefulShutdown = (signal: string) => {
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
+      console.log(`[shutdown] ${signal} received`);
+      shutdownController.abort();
+      await disposeAllDrmStates(`${signal} received`, !PRESERVE_LIVE_DIR);
+      console.log("[shutdown] cleanup complete");
+      Deno.exit(0);
+    })();
+    return shuttingDown;
+  };
+  Deno.addSignalListener("SIGINT", () => {
+    void gracefulShutdown("SIGINT");
+  });
+  Deno.addSignalListener("SIGTERM", () => {
+    void gracefulShutdown("SIGTERM");
+  });
+  const server = Deno.serve({ port: PORT, signal: shutdownController.signal }, handle);
+  await server.finished;
+  if (!shuttingDown) {
+    await disposeAllDrmStates("server stopped", !PRESERVE_LIVE_DIR);
+  } else {
+    await shuttingDown;
+  }
 }

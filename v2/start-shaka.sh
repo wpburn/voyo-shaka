@@ -3,6 +3,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+for arg in "$@"; do
+  case "$arg" in
+    --keep-live-data)
+      export VOYO_PRESERVE_LIVE_DIR=1
+      ;;
+    *)
+      echo "usage: $0 [--keep-live-data]" >&2
+      exit 1
+      ;;
+  esac
+done
+
 if [ ! -f l3.wvd ] && [ -z "${VOYO_CDM_DEVICE:-}" ]; then
   echo "error: no l3.wvd here and VOYO_CDM_DEVICE not set" >&2
   exit 1

@@ -17,6 +17,7 @@ services:
       VOYO_CDM_PORT: 8091
       VOYO_CONFIG_DIR: /data
       VOYO_CDM_DEVICE: /data/l3.wvd
+      VOYO_PRESERVE_LIVE_DIR: ${VOYO_PRESERVE_LIVE_DIR:-0}
       VOYO_UI_BASIC_AUTH_USER: ${VOYO_UI_BASIC_AUTH_USER:-adm}
       VOYO_UI_BASIC_AUTH_PASS: ${VOYO_UI_BASIC_AUTH_PASS:-fvoyo}
     volumes:

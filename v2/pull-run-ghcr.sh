@@ -10,6 +10,19 @@ APP_DIR="${APP_DIR:-/opt/voyo-shaka}"
 HOST_PORT="${HOST_PORT:-8090}"
 UI_USER="${UI_USER:-adm}"
 UI_PASS="${UI_PASS:-fvoyo}"
+PRESERVE_LIVE_DIR="${VOYO_PRESERVE_LIVE_DIR:-0}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --keep-live-data)
+      PRESERVE_LIVE_DIR=1
+      ;;
+    *)
+      echo "usage: $0 [--keep-live-data]" >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [ -z "${GHCR_USER}" ]; then
   echo "GHCR_USER is required" >&2
@@ -50,6 +63,7 @@ docker run -d \
   --restart unless-stopped \
   -p "${HOST_PORT}:8090" \
   -v "${APP_DIR}/data:/data" \
+  -e VOYO_PRESERVE_LIVE_DIR="${PRESERVE_LIVE_DIR}" \
   -e VOYO_UI_BASIC_AUTH_USER="${UI_USER}" \
   -e VOYO_UI_BASIC_AUTH_PASS="${UI_PASS}" \
   "${IMAGE_REF}"

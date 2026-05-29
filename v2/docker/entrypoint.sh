@@ -10,6 +10,7 @@ export VOYO_CDM_DEVICE="${VOYO_CDM_DEVICE:-/data/l3.wvd}"
 export VOYO_MP4DECRYPT="${VOYO_MP4DECRYPT:-/usr/local/bin/mp4decrypt}"
 export VOYO_SHAKA_PACKAGER="${VOYO_SHAKA_PACKAGER:-/usr/local/bin/packager}"
 export VOYO_SEED_DIR="${VOYO_SEED_DIR:-/seed-data}"
+export VOYO_PRESERVE_LIVE_DIR="${VOYO_PRESERVE_LIVE_DIR:-0}"
 
 mkdir -p "${VOYO_CONFIG_DIR}"
 
