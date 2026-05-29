@@ -1,5 +1,7 @@
 # Widevine device files — NEVER commit
 *.wvd
+.env
+.env.*
 private_key.pem
 client_id.bin
 

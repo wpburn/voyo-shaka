@@ -79,6 +79,7 @@ ENV PYTHONUNBUFFERED=1 \
     VOYO_CDM_PORT=8091 \
     VOYO_CONFIG_DIR=/data \
     VOYO_CDM_DEVICE=/data/l3.wvd \
+    VOYO_SEED_DIR=/seed-data \
     VOYO_MP4DECRYPT=/usr/local/bin/mp4decrypt \
     VOYO_SHAKA_PACKAGER=/usr/local/bin/packager
 

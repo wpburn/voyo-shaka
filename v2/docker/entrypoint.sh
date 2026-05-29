@@ -9,8 +9,18 @@ export VOYO_CDM_URL="${VOYO_CDM_URL:-http://127.0.0.1:${VOYO_CDM_PORT}}"
 export VOYO_CDM_DEVICE="${VOYO_CDM_DEVICE:-/data/l3.wvd}"
 export VOYO_MP4DECRYPT="${VOYO_MP4DECRYPT:-/usr/local/bin/mp4decrypt}"
 export VOYO_SHAKA_PACKAGER="${VOYO_SHAKA_PACKAGER:-/usr/local/bin/packager}"
+export VOYO_SEED_DIR="${VOYO_SEED_DIR:-/seed-data}"
 
 mkdir -p "${VOYO_CONFIG_DIR}"
+
+if [ -d "${VOYO_SEED_DIR}" ]; then
+  if [ -f "${VOYO_SEED_DIR}/l3.wvd" ] && [ ! -f "${VOYO_CONFIG_DIR}/l3.wvd" ]; then
+    cp "${VOYO_SEED_DIR}/l3.wvd" "${VOYO_CONFIG_DIR}/l3.wvd"
+  fi
+  if [ -f "${VOYO_SEED_DIR}/voyo.json" ] && [ ! -f "${VOYO_CONFIG_DIR}/voyo.json" ]; then
+    cp "${VOYO_SEED_DIR}/voyo.json" "${VOYO_CONFIG_DIR}/voyo.json"
+  fi
+fi
 
 if [ ! -f "${VOYO_CDM_DEVICE}" ]; then
   echo "error: Widevine device file not found at ${VOYO_CDM_DEVICE}" >&2

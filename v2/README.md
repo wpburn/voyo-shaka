@@ -41,6 +41,12 @@ The image:
 - downloads the official Shaka Packager Linux binary for the target architecture
 - caches Deno dependencies at build time, so normal container startup does not fetch code from the network
 
+Helper scripts in this folder:
+
+- [setup-ubuntu-vps.sh](/Users/flav/Downloads/iptvro_v2-main/v2/setup-ubuntu-vps.sh) installs Docker Engine, Buildx, and Compose on a fresh Ubuntu 24 server
+- [build-push-ghcr.sh](/Users/flav/Downloads/iptvro_v2-main/v2/build-push-ghcr.sh) builds and pushes a private GHCR runtime image from your Mac
+- [pull-run-ghcr.sh](/Users/flav/Downloads/iptvro_v2-main/v2/pull-run-ghcr.sh) pulls that image on Ubuntu and starts the container
+
 ### Docker quick start
 
 From the repo root:
@@ -106,6 +112,126 @@ VOYO_UI_BASIC_AUTH_USER=myuser \
 VOYO_UI_BASIC_AUTH_PASS=mypass \
 docker compose -f v2/docker-compose.shaka.yaml up --build -d
 ```
+
+### GHCR boxed-image flow
+
+Safe default: push only the runtime image to GHCR, then copy `l3.wvd` and `voyo.json` once to the Ubuntu server.
+
+Store your GHCR credentials in a local `.env` file that is **not committed**:
+
+```sh
+cd /path/to/iptvro_v2-main/v2
+cat > .env <<'EOF'
+GHCR_USER=prog-322
+GHCR_PAT=your-new-ghcr-token
+EOF
+```
+
+Load that file into the shell before using the helper scripts:
+
+```sh
+cd /path/to/iptvro_v2-main
+set -a
+source v2/.env
+set +a
+```
+
+If the Ubuntu VPS is `x86_64`, push an `amd64` runtime image from your Mac:
+
+```sh
+cd /path/to/iptvro_v2-main
+set -a
+source v2/.env
+set +a
+PLATFORMS=linux/amd64 \
+bash v2/build-push-ghcr.sh
+```
+
+The script pushes:
+
+- `ghcr.io/<user>/voyo-shaka:runtime` as the reusable base image
+- `ghcr.io/<user>/voyo-shaka:<timestamp>-runtime` as a versioned runtime tag
+
+If you want a true multi-arch image later, use:
+
+```sh
+cd /path/to/iptvro_v2-main
+set -a
+source v2/.env
+set +a
+PLATFORMS=linux/amd64,linux/arm64 \
+bash v2/build-push-ghcr.sh
+```
+
+Prepare a fresh Ubuntu 24 VPS:
+
+```sh
+scp v2/setup-ubuntu-vps.sh user@your-server:
+ssh user@your-server
+sudo bash setup-ubuntu-vps.sh
+```
+
+Copy your runtime files to the server:
+
+```sh
+scp v2/l3.wvd v2/voyo.json user@your-server:/tmp/
+ssh user@your-server
+sudo mkdir -p /opt/voyo-shaka/data
+sudo mv /tmp/l3.wvd /opt/voyo-shaka/data/l3.wvd
+sudo mv /tmp/voyo.json /opt/voyo-shaka/data/voyo.json
+sudo chown -R $USER:$USER /opt/voyo-shaka
+exit
+```
+
+Pull and run the runtime image on that server:
+
+```sh
+scp v2/pull-run-ghcr.sh user@your-server:
+ssh user@your-server
+cat > .env <<'EOF'
+GHCR_USER=prog-322
+GHCR_PAT=your-new-ghcr-token
+EOF
+set -a
+source .env
+set +a
+bash pull-run-ghcr.sh
+```
+
+Custom host port and UI credentials:
+
+```sh
+set -a
+source .env
+set +a
+HOST_PORT=8095 \
+UI_USER=myuser \
+UI_PASS=mypass \
+bash pull-run-ghcr.sh
+```
+
+Optional risky mode: build a boxed image that contains `l3.wvd` and `voyo.json` inside the image itself.
+
+```sh
+cd /path/to/iptvro_v2-main
+set -a
+source v2/.env
+set +a
+PUSH_BOXED=1 \
+bash v2/build-push-ghcr.sh
+```
+
+Then on the server:
+
+```sh
+set -a
+source .env
+set +a
+IMAGE_TAG=latest \
+bash pull-run-ghcr.sh
+```
+
+Warning: the boxed image contains your `l3.wvd` and `voyo.json`. Anyone who can pull that image can extract those files.
 
 ### Docker notes
 
