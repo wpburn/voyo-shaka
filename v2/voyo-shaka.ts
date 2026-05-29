@@ -11,7 +11,18 @@
 import { crypto as stdCrypto } from "jsr:@std/crypto/crypto";
 
 // === Types ===
-type Channel = { id: string; name: string; img: string; slug: string };
+type Channel = {
+  id: string;
+  contentId?: string | null;
+  name: string;
+  img: string;
+  slug: string;
+  kind?: "channel" | "event";
+  sourceUrl?: string | null;
+  streamKind?: "drm" | "hls" | "unknown";
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+};
 type StreamInfo = { url: string; isDrm: boolean; drm?: { url: string; headers: Record<string, string> } };
 type Creds = { username: string; password: string };
 type Session = { token: string | null; uuid: string | null; issuedAt: string | null };
@@ -19,7 +30,29 @@ type Config = {
   credentials: Creds;
   session: Session;
   channels: Channel[];
+  manualEvents: Channel[];
   channelsUpdatedAt: string | null;
+};
+
+const VOYO_CONTENT_TYPES = ["show", "tvshow", "movie", "episode", "trailer", "bonus", "channel", "livechannel", "live"] as const;
+const VOYO_TYPED_CONTENT_ID_RE = new RegExp(`^(${VOYO_CONTENT_TYPES.join("|")})([.-])(\\d+)$`, "i");
+const VOYO_URL_TYPE_MAP: Record<string, typeof VOYO_CONTENT_TYPES[number]> = {
+  "episodul": "episode",
+  "episode": "episode",
+  "bonusul": "bonus",
+  "bonus": "bonus",
+  "trailerul": "trailer",
+  "trailer": "trailer",
+  "filmul": "movie",
+  "film": "movie",
+  "serialul": "tvshow",
+  "serial": "tvshow",
+  "emisiunea": "show",
+  "emisiune": "show",
+  "canalul": "channel",
+  "canal": "channel",
+  "live": "live",
+  "livechannel": "livechannel",
 };
 
 // === Constants ===
@@ -89,6 +122,8 @@ class HttpError extends Error {
 function isUiProtectedRoute(path: string, method: string): boolean {
   if (method === "GET" && (path === "/" || path === "/mosaic" || path === "/proxy")) return true;
   if (method === "POST" && path === "/api/login") return true;
+  if (method === "POST" && path === "/api/events") return true;
+  if (method === "DELETE" && path.startsWith("/api/events/")) return true;
   if (method === "GET" && (path.startsWith("/play/") || path.startsWith("/api/channels") || path.startsWith("/api/stream/"))) {
     return true;
   }
@@ -186,17 +221,184 @@ async function resolveStream(channelId: string, token: string, uuid: string): Pr
   return info;
 }
 
+function titleCaseWords(input: string): string {
+  return input
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function humanizeSlug(slug: string): string {
+  const decoded = decodeURIComponent(slug).replaceAll("-", " ").trim();
+  return decoded ? titleCaseWords(decoded) : "Manual Event";
+}
+
+function normalizeTypedContentId(value: string): string | null {
+  const match = VOYO_TYPED_CONTENT_ID_RE.exec(value.trim());
+  if (!match) return null;
+  return `${match[1].toLowerCase()}.${match[3]}`;
+}
+
+function extractNumericContentTail(value: string): string | null {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return trimmed;
+  const match = VOYO_TYPED_CONTENT_ID_RE.exec(trimmed);
+  return match?.[3] ?? null;
+}
+
+function inferEventContentId(value: string): string {
+  return normalizeTypedContentId(value) ?? `episode.${extractNumericContentTail(value) ?? value.trim()}`;
+}
+
+function publicContentRouteId(value: string): string {
+  const normalized = normalizeTypedContentId(value);
+  if (!normalized) return value.trim();
+  const match = VOYO_TYPED_CONTENT_ID_RE.exec(normalized);
+  return match ? `${match[1].toLowerCase()}-${match[3]}` : value.trim();
+}
+
+function publicRoutePathFor(channel: Pick<Channel, "id" | "contentId" | "kind">): string {
+  const normalized = channel.kind === "event" && channel.contentId ? normalizeTypedContentId(channel.contentId) : null;
+  const match = normalized ? VOYO_TYPED_CONTENT_ID_RE.exec(normalized) : null;
+  return match ? `${match[1].toLowerCase()}/${match[3]}` : channel.id;
+}
+
+function contentRouteAliases(channel: Pick<Channel, "id" | "contentId">): string[] {
+  const aliases = new Set<string>([channel.id]);
+  const normalized = channel.contentId ? normalizeTypedContentId(channel.contentId) : null;
+  if (normalized) {
+    aliases.add(normalized);
+    aliases.add(publicContentRouteId(normalized));
+  }
+  return [...aliases].filter(Boolean);
+}
+
+function normalizeRequestedContentKey(value: string): string {
+  const decoded = decodeURIComponent(value.trim());
+  const routeMatch = /^([a-z]+)\/(\d+)$/i.exec(decoded);
+  if (routeMatch && VOYO_CONTENT_TYPES.includes(routeMatch[1].toLowerCase() as typeof VOYO_CONTENT_TYPES[number])) {
+    return `${routeMatch[1].toLowerCase()}.${routeMatch[2]}`;
+  }
+  return normalizeTypedContentId(decoded) ?? decoded;
+}
+
+function parseVoyoUrlContent(url: URL): { type: typeof VOYO_CONTENT_TYPES[number]; rawId: string; slug: string } | null {
+  const match = /\/([^/]+)\/(\d+)(?:-([^/?#]+))?/i.exec(url.pathname);
+  if (!match) return null;
+  const type = VOYO_URL_TYPE_MAP[match[1].toLowerCase()];
+  if (!type) return null;
+  return { type, rawId: match[2], slug: match[3] ?? match[2] };
+}
+
+function parseManualEventInput(input: string): Channel {
+  const value = input.trim();
+  if (!value) throw new Error("enter a Voyo event URL or content ID");
+  const typed = normalizeTypedContentId(value);
+  const numeric = extractNumericContentTail(value);
+  if (typed) {
+    const routeId = publicContentRouteId(typed);
+    return {
+      id: routeId,
+      contentId: typed,
+      name: `Event ${numeric ?? typed}`,
+      img: "",
+      slug: routeId.startsWith("event-") ? routeId : `event-${routeId}`,
+      kind: "event",
+      sourceUrl: null,
+      streamKind: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+    };
+  }
+  if (/^\d+$/.test(value)) {
+    const contentId = inferEventContentId(value);
+    return {
+      id: publicContentRouteId(contentId),
+      contentId,
+      name: `Event ${value}`,
+      img: "",
+      slug: `event-${publicContentRouteId(contentId)}`,
+      kind: "event",
+      sourceUrl: null,
+      streamKind: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+    };
+  }
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("invalid URL");
+  }
+  const parsedUrl = parseVoyoUrlContent(url);
+  if (!parsedUrl) throw new Error("unsupported Voyo URL path; use a typed ID like episode-134030");
+  const contentId = `${parsedUrl.type}.${parsedUrl.rawId}`;
+  const routeId = publicContentRouteId(contentId);
+  const slug = parsedUrl.slug ? `event-${parsedUrl.slug}` : `event-${routeId}`;
+  return {
+    id: routeId,
+    contentId,
+    name: humanizeSlug(parsedUrl.slug),
+    img: "",
+    slug,
+    kind: "event",
+    sourceUrl: url.toString(),
+    streamKind: "unknown",
+    lastCheckedAt: null,
+    lastError: null,
+  };
+}
+
+async function fetchPublicPageMeta(pageUrl: string): Promise<Partial<Channel>> {
+  const res = await fetch(pageUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml",
+    },
+  });
+  if (!res.ok) return {};
+  const html = await res.text();
+  const metaContent = (property: string) =>
+    new RegExp(`<meta[^>]+(?:property|name)="${property}"[^>]+content="([^"]+)"`, "i").exec(html)?.[1] ?? null;
+  const title = metaContent("og:title") ?? metaContent("twitter:title");
+  const image = metaContent("og:image") ?? metaContent("twitter:image");
+  return {
+    name: title ? title.split("|")[0].trim() : undefined,
+    img: image ?? undefined,
+  };
+}
+
+function contentIdFor(channel: Pick<Channel, "id" | "contentId"> | string): string {
+  return typeof channel === "string" ? channel : channel.contentId ?? channel.id;
+}
+
+async function probeStreamKind(
+  cacheKey: string,
+  contentId = cacheKey,
+): Promise<{ streamKind: "drm" | "hls" | "unknown"; lastError: string | null }> {
+  try {
+    const info = await getStreamInfo(cacheKey, true, contentId);
+    return { streamKind: info.isDrm ? "drm" : "hls", lastError: null };
+  } catch (e) {
+    return { streamKind: "unknown", lastError: (e as Error).message };
+  }
+}
+
 // === Stream info cache (signed URLs expire; ~30 min is safe) ===
 const STREAM_TTL_MS = 30 * 60 * 1000;
 const streamCache = new Map<string, { info: StreamInfo; expiresAt: number }>();
 
-async function getStreamInfo(channelId: string, force = false): Promise<StreamInfo> {
+async function getStreamInfo(cacheKey: string, force = false, contentId = cacheKey): Promise<StreamInfo> {
   if (!force) {
-    const hit = streamCache.get(channelId);
+    const hit = streamCache.get(cacheKey);
     if (hit && hit.expiresAt > Date.now()) return hit.info;
   }
-  const info = await withAuth((t, u) => resolveStream(channelId, t, u));
-  streamCache.set(channelId, { info, expiresAt: Date.now() + STREAM_TTL_MS });
+  const info = await withAuth((t, u) => resolveStream(contentId, t, u));
+  streamCache.set(cacheKey, { info, expiresAt: Date.now() + STREAM_TTL_MS });
   return info;
 }
 
@@ -228,13 +430,13 @@ async function extractPssh(mpdUrl: string): Promise<string> {
   throw new Error("no Widevine PSSH found in MPD");
 }
 
-async function getKeys(channelId: string, force = false): Promise<ContentKey[]> {
+async function getKeys(cacheKey: string, force = false, contentId = cacheKey): Promise<ContentKey[]> {
   if (!force) {
-    const hit = keyCache.get(channelId);
+    const hit = keyCache.get(cacheKey);
     if (hit && hit.expiresAt > Date.now()) return hit.keys;
   }
-  const info = await getStreamInfo(channelId, force);
-  if (!info.drm) throw new Error(`channel ${channelId} is not DRM`);
+  const info = await getStreamInfo(cacheKey, force, contentId);
+  if (!info.drm) throw new Error(`channel ${cacheKey} is not DRM`);
   const pssh = await extractPssh(info.url);
   let res: Response;
   try {
@@ -252,7 +454,7 @@ async function getKeys(channelId: string, force = false): Promise<ContentKey[]> 
   }
   const keys = await res.json() as ContentKey[];
   if (!Array.isArray(keys) || keys.length === 0) throw new Error("CDM returned no content keys");
-  keyCache.set(channelId, { keys, expiresAt: Date.now() + KEY_TTL_MS });
+  keyCache.set(cacheKey, { keys, expiresAt: Date.now() + KEY_TTL_MS });
   return keys;
 }
 
@@ -333,6 +535,7 @@ type PackagerHandle = {
 };
 type DrmChannelState = {
   channelId: string;
+  contentId: string;
   workDir: string;
   dirs: ChannelDirs;
   pipePaths: PipePaths;
@@ -843,7 +1046,7 @@ function isExpiredStreamError(error: unknown): boolean {
 }
 
 async function refreshDrmState(state: DrmChannelState, force = false): Promise<void> {
-  const info = await getStreamInfo(state.channelId, force);
+  const info = await getStreamInfo(state.channelId, force, state.contentId);
   if (!info.drm) throw new Error("channel is not DRM — use /live/<id>.m3u8");
   const snapshot = await fetchMpdSnapshot(info.url);
   const video = chooseRepresentation(snapshot.parsed.video, state.video?.source.representationId);
@@ -1094,6 +1297,8 @@ async function startDrmState(channelId: string): Promise<DrmChannelState> {
   await ensureMp4decrypt();
   await ensureShakaPackager();
   await ensureCdmHealthy();
+  const entry = findChannel(channelId);
+  const resolvedContentId = contentIdFor(entry ?? channelId);
 
   const workDir = `${LIVE_DIR}/${channelId}`;
   const dirs: ChannelDirs = {
@@ -1111,6 +1316,7 @@ async function startDrmState(channelId: string): Promise<DrmChannelState> {
   void ready.promise.catch(() => {});
   const state: DrmChannelState = {
     channelId,
+    contentId: resolvedContentId,
     workDir,
     dirs,
     pipePaths: { audio: `${dirs.pipes}/audio.pipe`, video: `${dirs.pipes}/video.pipe` },
@@ -1125,7 +1331,7 @@ async function startDrmState(channelId: string): Promise<DrmChannelState> {
     stopRequested: false,
     closed: false,
     streamInfo: null,
-    keys: await getKeys(channelId),
+    keys: await getKeys(channelId, false, resolvedContentId),
     audio: null,
     video: null,
     manifest: null,
@@ -1231,8 +1437,45 @@ const emptyConfig: Config = {
   credentials: { username: "", password: "" },
   session: { token: null, uuid: null, issuedAt: null },
   channels: [],
+  manualEvents: [],
   channelsUpdatedAt: null,
 };
+
+function normalizeConfig(data: Partial<Config>): Config {
+  const normalizeChannel = (entry: Partial<Channel>, fallbackKind?: "channel" | "event"): Channel => {
+    const kind = entry.kind ?? fallbackKind;
+    const contentId = entry.contentId ?? (kind === "event" && entry.id ? inferEventContentId(entry.id) : null);
+    const id = kind === "event" && contentId ? publicContentRouteId(contentId) : (entry.id ?? "");
+    return {
+      id,
+      contentId,
+      name: entry.name ?? "",
+      img: entry.img ?? "",
+      slug: entry.slug ?? slugify(entry.name ?? id),
+      kind,
+      sourceUrl: entry.sourceUrl ?? null,
+      streamKind: entry.streamKind ?? "unknown",
+      lastCheckedAt: entry.lastCheckedAt ?? null,
+      lastError: entry.lastError ?? null,
+    };
+  };
+  return {
+    ...emptyConfig,
+    ...data,
+    credentials: {
+      username: data.credentials?.username ?? emptyConfig.credentials.username,
+      password: data.credentials?.password ?? emptyConfig.credentials.password,
+    },
+    session: {
+      token: data.session?.token ?? emptyConfig.session.token,
+      uuid: data.session?.uuid ?? emptyConfig.session.uuid,
+      issuedAt: data.session?.issuedAt ?? emptyConfig.session.issuedAt,
+    },
+    channels: Array.isArray(data.channels) ? data.channels.map((entry) => normalizeChannel(entry, "channel")) : [],
+    manualEvents: Array.isArray(data.manualEvents) ? data.manualEvents.map((entry) => normalizeChannel(entry, "event")) : [],
+    channelsUpdatedAt: data.channelsUpdatedAt ?? null,
+  };
+}
 
 function migrateFromV1(data: { auth?: { username?: string; password?: string } }): Config {
   return {
@@ -1244,7 +1487,11 @@ function migrateFromV1(data: { auth?: { username?: string; password?: string } }
 async function loadConfig(): Promise<{ config: Config; mutated: boolean }> {
   try {
     const data = JSON.parse(await Deno.readTextFile(CONFIG_PATH));
-    if (data.credentials) return { config: data, mutated: false };
+    if (data.credentials) {
+      const normalized = normalizeConfig(data);
+      const mutated = JSON.stringify(normalized) !== JSON.stringify(data);
+      return { config: normalized, mutated };
+    }
     if (data.auth?.username) {
       console.log(`[config] migrating v1-shaped ${CONFIG_PATH} → v2`);
       return { config: migrateFromV1(data), mutated: true };
@@ -1311,7 +1558,90 @@ async function getChannels(force = false): Promise<Channel[]> {
     config.channelsUpdatedAt = new Date().toISOString();
     await saveConfig();
   }
-  return config.channels;
+  return getEntries(force);
+}
+
+function allEntries(): Channel[] {
+  return [...config.manualEvents, ...config.channels];
+}
+
+async function refreshManualEvents(force = false): Promise<void> {
+  let mutated = false;
+  for (const entry of config.manualEvents) {
+    const resolvedContentId = contentIdFor(entry);
+    if (entry.contentId !== resolvedContentId) {
+      entry.contentId = resolvedContentId;
+      mutated = true;
+    }
+    const checkedAt = entry.lastCheckedAt ? new Date(entry.lastCheckedAt).getTime() : 0;
+    const stale = !checkedAt || (Date.now() - checkedAt > 5 * 60 * 1000);
+    if (!force && !stale) continue;
+    const probed = await probeStreamKind(entry.id, resolvedContentId);
+    if (entry.streamKind !== probed.streamKind || entry.lastError !== probed.lastError || force) {
+      entry.streamKind = probed.streamKind;
+      entry.lastError = probed.lastError;
+      entry.lastCheckedAt = new Date().toISOString();
+      mutated = true;
+    }
+  }
+  if (mutated) await saveConfig();
+}
+
+async function getEntries(force = false): Promise<Channel[]> {
+  if (config.manualEvents.length > 0) await refreshManualEvents(force);
+  return allEntries();
+}
+
+async function addManualEvent(value: string): Promise<Channel> {
+  const parsed = parseManualEventInput(value);
+  const parsedContentId = contentIdFor(parsed);
+  const existing = config.manualEvents.find((entry) =>
+    entry.id === parsed.id ||
+    contentIdFor(entry) === parsedContentId ||
+    contentRouteAliases(entry).includes(parsed.id)
+  );
+  const base = existing ?? parsed;
+  base.contentId = parsed.contentId ?? base.contentId ?? inferEventContentId(base.id);
+  if (parsed.sourceUrl) base.sourceUrl = parsed.sourceUrl;
+  if (parsed.slug) base.slug = parsed.slug;
+  if (!existing || !existing.name || /^Event \d+$/.test(existing.name)) {
+    base.name = parsed.name;
+  }
+  if (base.sourceUrl) {
+    try {
+      const meta = await fetchPublicPageMeta(base.sourceUrl);
+      if (meta.name) base.name = meta.name;
+      if (meta.img) base.img = meta.img;
+    } catch {
+      // Public metadata is only a best-effort enhancement.
+    }
+  }
+  const probed = await probeStreamKind(base.id, contentIdFor(base));
+  base.streamKind = probed.streamKind;
+  base.lastError = probed.lastError;
+  base.lastCheckedAt = new Date().toISOString();
+  base.kind = "event";
+  if (!existing) config.manualEvents.unshift(base);
+  await saveConfig();
+  return base;
+}
+
+async function removeManualEvent(requested: string): Promise<boolean> {
+  const normalizedRequested = normalizeTypedContentId(requested);
+  const existing = config.manualEvents.find((entry) =>
+    entry.id === requested ||
+    entry.slug === requested ||
+    contentRouteAliases(entry).includes(requested) ||
+    (!!normalizedRequested && contentIdFor(entry) === normalizedRequested)
+  );
+  if (!existing) return false;
+  config.manualEvents = config.manualEvents.filter((entry) => entry.id !== existing.id);
+  streamCache.delete(existing.id);
+  keyCache.delete(existing.id);
+  const state = drmStates.get(existing.id);
+  if (state) await disposeState(state, "manual event removed");
+  await saveConfig();
+  return true;
 }
 
 // === HLS rewriting ===
@@ -1353,6 +1683,13 @@ function rewriteDashManifest(xml: string, baseUrl: string): string {
   return rewritten;
 }
 
+function entryLikelyDrm(entry: Channel): boolean {
+  if (entry.streamKind === "drm") return true;
+  if (entry.streamKind === "hls") return false;
+  if (entry.kind === "event") return true;
+  return /drm|cetin|widevine/i.test(entry.name);
+}
+
 function proxyFetchHeaders(req?: Request): HeadersInit {
   const stableUa =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -1369,7 +1706,8 @@ function proxyFetchHeaders(req?: Request): HeadersInit {
 }
 
 async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
-  const info = await withAuth((t, u) => resolveStream(channelId, t, u));
+  const entry = findChannel(channelId);
+  const info = await getStreamInfo(channelId, false, contentIdFor(entry ?? channelId));
   if (info.isDrm) {
     return new Response(
       `channel ${channelId} is DRM (DASH+Widevine); open /play/${channelId} in Chrome instead`,
@@ -1411,7 +1749,15 @@ async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promis
 }
 
 function findChannel(requested: string): Channel | undefined {
-  return config.channels.find((channel) => channel.id === requested || channel.slug === requested);
+  const decodedRequested = decodeURIComponent(requested);
+  const normalizedRequested = normalizeRequestedContentKey(decodedRequested);
+  return allEntries().find((channel) =>
+    channel.id === decodedRequested ||
+    channel.slug === decodedRequested ||
+    publicRoutePathFor(channel) === decodedRequested ||
+    contentRouteAliases(channel).includes(decodedRequested) ||
+    (!!normalizedRequested && contentIdFor(channel) === normalizedRequested)
+  );
 }
 
 function serializeTrackState(track: TrackRuntime | null) {
@@ -1476,6 +1822,27 @@ async function handle(req: Request): Promise<Response> {
     }
   }
 
+  if (method === "POST" && path === "/api/events") {
+    try {
+      const body = await req.json().catch(() => ({})) as { value?: string };
+      const entry = await addManualEvent(body.value ?? "");
+      return Response.json({ ok: true, entry });
+    } catch (e) {
+      return Response.json({ ok: false, error: (e as Error).message }, { status: 400 });
+    }
+  }
+
+  if (method === "DELETE" && path.startsWith("/api/events/")) {
+    const requested = decodeURIComponent(path.slice("/api/events/".length));
+    try {
+      const removed = await removeManualEvent(requested);
+      if (!removed) return Response.json({ ok: false, error: `unknown event: ${requested}` }, { status: 404 });
+      return Response.json({ ok: true });
+    } catch (e) {
+      return Response.json({ ok: false, error: (e as Error).message }, { status: 500 });
+    }
+  }
+
   if (method === "GET" && path === "/live.m3u8") {
     // mode=hls   → only non-DRM (legacy default, safest for VLC if CDM is offline)
     // mode=all   → DRM channels too, via /vlc/<id>/index.m3u8 (needs cdm.py running)
@@ -1486,10 +1853,10 @@ async function handle(req: Request): Promise<Response> {
       const channels = await getChannels();
       const lines = ["#EXTM3U"];
       for (const ch of channels) {
-        const isDrmName = /drm|cetin|widevine/i.test(ch.name);
-        const target = isDrmName
-          ? (includeDrm ? `http://${host}/vlc/${ch.id}/index.m3u8` : null)
-          : `http://${host}/live/${ch.id}.m3u8`;
+        const routePath = publicRoutePathFor(ch);
+        const target = entryLikelyDrm(ch)
+          ? (includeDrm ? `http://${host}/vlc/${routePath}/index.m3u8` : null)
+          : `http://${host}/live/${routePath}.m3u8`;
         if (!target) continue;
         lines.push(`#EXTINF:-1 tvg-id="${ch.id}" tvg-logo="${ch.img}" group-title="Voyo",${ch.name}`);
         lines.push(target);
@@ -1503,7 +1870,7 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/live/") && path.endsWith(".m3u8")) {
-    const requested = path.slice("/live/".length, -".m3u8".length);
+    const requested = decodeURIComponent(path.slice("/live/".length, -".m3u8".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
@@ -1517,12 +1884,12 @@ async function handle(req: Request): Promise<Response> {
 
   // Debug: hex content keys from CDM sidecar. ?force=1 bypasses the cache.
   if (method === "GET" && path.startsWith("/api/keys/")) {
-    const requested = path.slice("/api/keys/".length);
+    const requested = decodeURIComponent(path.slice("/api/keys/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
-      const keys = await getKeys(ch.id, url.searchParams.get("force") === "1");
+      const keys = await getKeys(ch.id, url.searchParams.get("force") === "1", contentIdFor(ch));
       return Response.json(keys);
     } catch (e) {
       return Response.json({ error: (e as Error).message }, { status: 500 });
@@ -1530,7 +1897,7 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/api/drm-state/")) {
-    const requested = path.slice("/api/drm-state/".length);
+    const requested = decodeURIComponent(path.slice("/api/drm-state/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
@@ -1569,7 +1936,7 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/api/drm-manifest/")) {
-    const requested = path.slice("/api/drm-manifest/".length);
+    const requested = decodeURIComponent(path.slice("/api/drm-manifest/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
@@ -1583,7 +1950,7 @@ async function handle(req: Request): Promise<Response> {
           xml: state.manifestXml,
         });
       }
-      const info = await getStreamInfo(ch.id, url.searchParams.get("force") === "1");
+      const info = await getStreamInfo(ch.id, url.searchParams.get("force") === "1", contentIdFor(ch));
       if (!info.drm) return Response.json({ error: `channel ${requested} is not DRM` }, { status: 400 });
       const snapshot = await fetchMpdSnapshot(info.url);
       return Response.json({
@@ -1598,7 +1965,7 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/api/drm-log/")) {
-    const requested = path.slice("/api/drm-log/".length);
+    const requested = decodeURIComponent(path.slice("/api/drm-log/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
@@ -1622,15 +1989,17 @@ async function handle(req: Request): Promise<Response> {
   // and sibling files are Shaka Packager output files under the per-channel out/ directory.
   if (method === "GET" && path.startsWith("/vlc/")) {
     const rest = path.slice("/vlc/".length);
-    const slash = rest.indexOf("/");
-    // /vlc/<id>.m3u8 → redirect to canonical /vlc/<id>/index.m3u8
-    if (slash < 0 && rest.endsWith(".m3u8")) {
-      const id = rest.slice(0, -".m3u8".length);
+    const parts = rest.split("/").filter(Boolean);
+    if (parts.length === 1 && parts[0].endsWith(".m3u8")) {
+      const id = decodeURIComponent(parts[0].slice(0, -".m3u8".length));
       return Response.redirect(`http://${host}/vlc/${id}/index.m3u8`, 302);
     }
-    if (slash <= 0) return new Response("bad path", { status: 400 });
-    const requested = rest.slice(0, slash);
-    const filename = rest.slice(slash + 1);
+    if (parts.length < 2) return new Response("bad path", { status: 400 });
+    const typedRoute = parts.length >= 3 &&
+      VOYO_CONTENT_TYPES.includes(parts[0].toLowerCase() as typeof VOYO_CONTENT_TYPES[number]) &&
+      /^\d+$/.test(parts[1]);
+    const requested = decodeURIComponent(typedRoute ? `${parts[0]}/${parts[1]}` : parts[0]);
+    const filename = (typedRoute ? parts.slice(2) : parts.slice(1)).join("/");
     try {
       await getChannels();
       const ch = findChannel(requested);
@@ -1646,18 +2015,19 @@ async function handle(req: Request): Promise<Response> {
   // JSON stream info for the in-browser player. For DRM channels, licenseUrl is /license/<id>
   // so the browser doesn't need the upstream Voyo bearer token.
   if (method === "GET" && path.startsWith("/api/stream/")) {
-    const requested = path.slice("/api/stream/".length);
+    const requested = decodeURIComponent(path.slice("/api/stream/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
       if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
-      const info = await getStreamInfo(ch.id);
+      const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
       return Response.json({
         id: ch.id,
+        routePath: publicRoutePathFor(ch),
         name: ch.name,
         manifestUrl: info.url,
         isDrm: info.isDrm,
-        licenseUrl: info.drm ? `/license/${ch.id}` : null,
+        licenseUrl: info.drm ? `/license/${publicRoutePathFor(ch)}` : null,
       });
     } catch (e) {
       streamCache.delete(requested);
@@ -1668,18 +2038,18 @@ async function handle(req: Request): Promise<Response> {
   // Widevine license proxy: forwards the challenge to Voyo's license server with the
   // saved Authorization headers, returns the binary license back to Shaka.
   if (method === "POST" && path.startsWith("/license/")) {
-    const requested = path.slice("/license/".length);
+    const requested = decodeURIComponent(path.slice("/license/".length));
     try {
       await getChannels();
       const ch = findChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
-      let info = await getStreamInfo(ch.id);
+      let info = await getStreamInfo(ch.id, false, contentIdFor(ch));
       if (!info.drm) return new Response(`channel ${requested} is not DRM`, { status: 400 });
       const body = await req.arrayBuffer();
       let upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
       if (upstream.status === 401 || upstream.status === 403) {
         // Signed URL or token went stale — refresh once.
-        info = await getStreamInfo(ch.id, true);
+        info = await getStreamInfo(ch.id, true, contentIdFor(ch));
         if (info.drm) upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
       }
       const ct = upstream.headers.get("content-type") ?? "application/octet-stream";
@@ -1745,6 +2115,8 @@ const INDEX_HTML = `<!doctype html>
   body { font: 14px/1.45 system-ui, -apple-system, sans-serif; margin: 0; background: #0f1115; color: #e6e9ef; }
   header { padding: 14px 20px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; position: sticky; top: 0; background: #0f1115; z-index: 1; }
   header h1 { font-size: 16px; margin: 0; margin-right: auto; }
+  .eventbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .eventbar input { width: min(460px, 44vw); padding: 7px 10px; border-radius: 6px; border: 1px solid #2a3142; background: #10141c; color: #d7e3ff; font: inherit; }
   button { background: #1e2230; border: 1px solid #2a3142; color: #e6e9ef; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
   button:hover { background: #252b3c; }
   button:active { transform: translateY(1px); }
@@ -1759,6 +2131,9 @@ const INDEX_HTML = `<!doctype html>
   .actions { text-align: right; white-space: nowrap; }
   .actions a { color: #8ab4f8; margin-right: 10px; font-size: 12px; text-decoration: none; }
   .actions a:hover { text-decoration: underline; }
+  .meta { display: block; margin-top: 4px; font-size: 11px; opacity: .62; }
+  .meta a { color: #8ab4f8; }
+  .manual-url { display: block; width: min(420px, 46vw); margin-top: 8px; margin-left: auto; padding: 6px 8px; border: 1px solid #2a3142; border-radius: 6px; background: #0f1218; color: #d7e3ff; font: 11px/1.3 ui-monospace, SFMono-Regular, monospace; }
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #2a3142; padding: 10px 18px; border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 80vw; overflow: hidden; text-overflow: ellipsis; }
   .toast.show { opacity: 1; }
   .empty { padding: 40px; text-align: center; opacity: .55; }
@@ -1772,6 +2147,10 @@ const INDEX_HTML = `<!doctype html>
   <button id="relogin" title="Force a new login">🔑 Re-login</button>
   <button id="mosaic2" title="Open 2 selected channels in a 1x2 mosaic">▦ Mosaic 2</button>
   <span class="combo">VLC playlist: <a id="combo" href="/live.m3u8">/live.m3u8</a></span>
+  <div class="eventbar">
+    <input id="eventInput" type="text" placeholder="Paste Voyo event URL or content ID">
+    <button id="addEvent" title="Add temporary Voyo event">＋ Add event</button>
+  </div>
 </header>
 <table>
   <tbody id="rows"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
@@ -1800,30 +2179,93 @@ async function load(force) {
 }
 function render(channels) {
   if (!channels.length) { rows.innerHTML = '<tr><td colspan="3" class="empty">No channels yet — try Re-login then Refresh.</td></tr>'; return; }
-  const isDrm = (n) => /drm|cetin|widevine/i.test(n);
+  const isDrm = (c) => c.streamKind === 'drm' || (c.streamKind !== 'hls' && (c.kind === 'event' || /drm|cetin|widevine/i.test(c.name)));
+  const routePath = (c) => {
+    if (c.kind === 'event' && c.contentId) {
+      const match = /^([a-z]+)[.-](\d+)$/i.exec(c.contentId);
+      if (match) return match[1].toLowerCase() + '/' + match[2];
+    }
+    return c.id;
+  };
+  const canClipboard = !!(window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText);
   rows.innerHTML = channels.map(c => {
-    const drm = isDrm(c.name);
+    const drm = isDrm(c);
+    const route = routePath(c);
     const img = c.img ? '<img class="logo" src="' + c.img + '" loading="lazy" alt="">' : '';
     const lock = drm ? '<span class="lock" title="DRM — VLC link uses server-side decrypt via cdm.py">🔒</span>' : '';
+    const marker = c.kind === 'event' ? '<span class="lock" title="Temporary manual event">📍</span>' : '';
+    const meta = c.kind === 'event'
+      ? '<span class="meta">' + (c.sourceUrl ? '<a href="' + c.sourceUrl + '" target="_blank">source</a>' : 'manual event') + (c.lastError ? ' • ' + c.lastError : '') + '</span>'
+      : '';
     // For DRM channels the VLC-friendly URL is the server-decrypted /vlc/<id>/index.m3u8.
-    const hls = drm ? '/vlc/' + c.id + '/index.m3u8' : '/live/' + c.id + '.m3u8';
-    const play = '/play/' + c.id;
+    const hls = drm ? '/vlc/' + route + '/index.m3u8' : '/live/' + route + '.m3u8';
+    const fullHls = location.protocol + '//' + location.host + hls;
+    const play = '/play/' + route;
     return '<tr>' +
       '<td style="width:80px">' + img + '</td>' +
-      '<td><label><input type="checkbox" class="pick" data-id="' + c.id + '" data-name="' + c.name + '"> <span class="name">' + c.name + '</span>' + lock + '</label></td>' +
+      '<td><label><input type="checkbox" class="pick" data-id="' + c.id + '" data-name="' + c.name + '"> <span class="name">' + c.name + '</span>' + lock + marker + '</label>' + meta + '</td>' +
       '<td class="actions">' +
         '<a href="' + play + '" target="_blank">▶ Play</a>' +
         '<a href="' + hls + '" target="_blank" data-url="' + hls + '">' + (drm ? '.m3u8 (VLC)' : '.m3u8') + '</a>' +
-        '<button data-id="' + c.id + '" data-url="' + hls + '">📋 Copy URL</button>' +
+        '<button data-action="copy" data-id="' + c.id + '" data-url="' + hls + '">' + (canClipboard ? '📋 Copy URL' : '📋 Select URL') + '</button>' +
+        (c.kind === 'event' ? '<button data-action="remove-event" data-id="' + c.id + '">✕ Remove</button>' : '') +
+        (canClipboard ? '' : '<input class="manual-url" type="text" readonly value="' + fullHls + '" data-manual-url>') +
       '</td>' +
     '</tr>';
   }).join('');
 }
 rows.addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-id]');
+  const btn = e.target.closest('button[data-action][data-id]');
   if (!btn) return;
+  if (btn.dataset.action === 'remove-event') {
+    fetch('/api/events/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' })
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        toast('Removed event');
+        load(false);
+      })
+      .catch((err) => toast('Error: ' + err.message, true));
+    return;
+  }
   const url = location.protocol + '//' + location.host + (btn.dataset.url || '/live/' + btn.dataset.id + '.m3u8');
-  navigator.clipboard.writeText(url).then(() => toast('Copied: ' + url));
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(() => toast('Copied: ' + url));
+    return;
+  }
+  const input = btn.parentElement && btn.parentElement.querySelector('input[data-manual-url]');
+  if (input) {
+    input.focus();
+    input.select();
+    toast('Manual copy: selected URL');
+  } else {
+    toast(url);
+  }
+});
+document.getElementById('addEvent').onclick = async () => {
+  const input = document.getElementById('eventInput');
+  const value = input.value.trim();
+  if (!value) { toast('Paste a Voyo event URL or content ID', true); return; }
+  try {
+    const r = await fetch('/api/events', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    input.value = '';
+    toast('Added event: ' + data.entry.name);
+    load(true);
+  } catch (e) {
+    toast('Error: ' + e.message, true);
+  }
+};
+document.getElementById('eventInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('addEvent').click();
+  }
 });
 document.getElementById('refresh').onclick = () => load(true);
 document.getElementById('relogin').onclick = async () => {
@@ -1954,7 +2396,7 @@ const PLAY_HTML = `<!doctype html>
   setStatus('resolving…');
   let info;
   try {
-    const r = await fetch('/api/stream/' + encodeURIComponent(id));
+    const r = await fetch('/api/stream/' + id.split('/').map(encodeURIComponent).join('/'));
     info = await r.json();
     if (!r.ok || info.error) throw new Error(info.error || ('HTTP ' + r.status));
   } catch (e) { setStatus(e.message, true); return; }
@@ -2083,7 +2525,7 @@ if (!ids.length) {
   g.outerHTML = '<div class="empty">add ?ids=channel-X,channel-Y to the URL</div>';
 } else {
   g.className = 'grid n' + Math.min(ids.length, 9);
-  g.innerHTML = ids.map(id => '<iframe src="/play/' + encodeURIComponent(id) + '?embed=1" allow="autoplay; encrypted-media; microphone"></iframe>').join('');
+  g.innerHTML = ids.map(id => '<iframe src="/play/' + id.split('/').map(encodeURIComponent).join('/') + '?embed=1" allow="autoplay; encrypted-media; microphone"></iframe>').join('');
 }
 </script>
 </body>
