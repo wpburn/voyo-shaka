@@ -481,8 +481,8 @@ const PIPE_NO_PROGRESS_MS = 60 * 1000;
 const PIPE_RETRY_DELAYS_MS = [3_000, 6_000, 12_000] as const;
 const PIPE_RETRY_CAP_MS = 20_000;
 const PIPE_RETRY_JITTER_RATIO = 0.2;
-const DRM_RESTART_COOLDOWN_MS = [10_000, 10_000, 20_000, 20_000, 30_000, 60_000, 60_000, 120_000, 240_000, 300_000] as const;
-const DRM_RESTART_COOLDOWN_CAP_MS = 300_000;
+const DRM_RESTART_COOLDOWN_MS = [10_000, 10_000, 20_000, 20_000, 30_000, 60_000, 60_000, 120_000, 180_000] as const;
+const DRM_RESTART_COOLDOWN_CAP_MS = 180_000;
 
 type TrackKind = "audio" | "video";
 type ParsedSegment = {
@@ -1426,6 +1426,13 @@ async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string
   await ensureDir(workDir);
   await clearDir(workDir);
   await Promise.all([ensureDir(dirs.enc), ensureDir(dirs.dec), ensureDir(dirs.pipes), ensureDir(dirs.out), ensureDir(dirs.logs)]);
+  let keys: ContentKey[];
+  try {
+    keys = await getKeys(channelId, false, resolvedContentId);
+  } catch (e) {
+    recordRestartCooldown(channelId, (e as Error).message);
+    throw e;
+  }
 
   const ready = deferred<string>();
   void ready.promise.catch(() => {});
@@ -1446,7 +1453,7 @@ async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string
     stopRequested: false,
     closed: false,
     streamInfo: null,
-    keys: await getKeys(channelId, false, resolvedContentId),
+    keys,
     audio: null,
     video: null,
     manifest: null,
