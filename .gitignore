@@ -11,3 +11,4 @@ logs
 *.pem
 *.key
 *.crt
+/v2/live-shaka

@@ -2,11 +2,23 @@
 
 Single-file Deno 2 server that exposes Voyo Romania live channels as plain HLS playlists for VLC/IPTV apps.
 
+This folder now has two entry points:
+
+- `voyo.ts` for the original baseline
+- `voyo-shaka.ts` for the parallel Shaka Packager implementation
+
 ## Run
 
 ```sh
 cd v2
 deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo.ts
+```
+
+Shaka variant:
+
+```sh
+cd v2
+deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo-shaka.ts
 ```
 
 `--allow-run` is only needed for experimental helper paths. The normal server works for non-DRM channels and the in-browser Shaka player.
@@ -18,7 +30,16 @@ deno compile --allow-read --allow-write --allow-net --allow-env --output voyo vo
 ./voyo
 ```
 
+For the Shaka build, replace `voyo.ts` with `voyo-shaka.ts` and choose a different output name.
+
 Open <http://localhost:8090>. `voyo.json` is read/written next to the executable (or next to the script in dev mode); override with `VOYO_CONFIG_DIR=/path/to/dir`, change port with `VOYO_PORT=9000`. On first run it migrates credentials from `../configs/voyo.json` if present, otherwise it creates an empty `voyo.json` — fill in `credentials.username` / `credentials.password` and restart.
+
+`voyo-shaka.ts` also protects the UI/browser routes with HTTP Basic Auth by default:
+
+- username: `adm`
+- password: `fvoyo`
+
+Override with `VOYO_UI_BASIC_AUTH_USER` and `VOYO_UI_BASIC_AUTH_PASS`.
 
 ### Cross-compile
 
@@ -74,6 +95,12 @@ pip install -r requirements.txt
 ./start.sh
 ```
 
+Shaka one-shot startup:
+
+```sh
+./start-shaka.sh
+```
+
 Or run them separately:
 
 ```sh
@@ -82,6 +109,13 @@ python3 cdm.py
 
 # terminal 2
 deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo.ts
+```
+
+Shaka variant:
+
+```sh
+# terminal 2
+deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo-shaka.ts
 ```
 
 Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `http://<host>:8090/live.m3u8` to get every channel (DRM included). Two or more concurrent channels are fine — each gets its own ffmpeg, killed automatically after 60s of nobody pulling segments.
@@ -95,6 +129,9 @@ Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `h
 | `VOYO_CDM_DEVICE` | `./l3.wvd`            | path to your L3 device file |
 | `VOYO_FFMPEG`   | `ffmpeg`                | ffmpeg binary path |
 | `VOYO_MP4DECRYPT` | `mp4decrypt`          | Bento4 `mp4decrypt` binary path |
+| `VOYO_SHAKA_PACKAGER` | `packager`         | Shaka Packager binary path for `voyo-shaka.ts` |
+| `VOYO_UI_BASIC_AUTH_USER` | `adm`          | UI/browser Basic Auth username for `voyo-shaka.ts` |
+| `VOYO_UI_BASIC_AUTH_PASS` | `fvoyo`        | UI/browser Basic Auth password for `voyo-shaka.ts` |
 
 **Caveats:**
 - L1 (HD/4K) is intentionally not supported — would require a rooted-Android TEE proxy, not worth the operational pain. Stick with L3.
