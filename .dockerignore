@@ -1,2 +1,12 @@
 configs
 logs
+.git
+.venv
+.venv-keydive
+v2/.venv
+v2/.venv-keydive
+v2/live
+v2/live-shaka
+v2/packager
+v2/*.wvd
+**/.DS_Store

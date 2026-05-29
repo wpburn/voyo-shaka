@@ -5,6 +5,8 @@ client_id.bin
 
 # transient HLS output from ffmpeg pipes
 live/
+live-shaka/
+data/
 
 # python virtualenv for cdm.py
 .venv/

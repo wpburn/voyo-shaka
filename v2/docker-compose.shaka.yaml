@@ -1,0 +1,23 @@
+services:
+  voyo-shaka:
+    container_name: voyo-shaka
+    build:
+      context: ..
+      dockerfile: v2/docker/Dockerfile
+      args:
+        BENTO4_VERSION: ${BENTO4_VERSION:-v1.6.0-641}
+        SHAKA_PACKAGER_VERSION: ${SHAKA_PACKAGER_VERSION:-v3.7.2}
+        DENO_VERSION: ${DENO_VERSION:-2.3.7}
+    image: iptvro-voyo-shaka:latest
+    restart: unless-stopped
+    ports:
+      - "${VOYO_HOST_PORT:-8090}:8090"
+    environment:
+      VOYO_PORT: 8090
+      VOYO_CDM_PORT: 8091
+      VOYO_CONFIG_DIR: /data
+      VOYO_CDM_DEVICE: /data/l3.wvd
+      VOYO_UI_BASIC_AUTH_USER: ${VOYO_UI_BASIC_AUTH_USER:-adm}
+      VOYO_UI_BASIC_AUTH_PASS: ${VOYO_UI_BASIC_AUTH_PASS:-fvoyo}
+    volumes:
+      - ./data:/data

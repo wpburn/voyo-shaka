@@ -21,6 +21,99 @@ cd v2
 deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo-shaka.ts
 ```
 
+## Docker
+
+There is a dedicated container setup for the working Shaka path:
+
+- compose file: [docker-compose.shaka.yaml](/Users/flav/Downloads/iptvro_v2-main/v2/docker-compose.shaka.yaml)
+- image build: [docker/Dockerfile](/Users/flav/Downloads/iptvro_v2-main/v2/docker/Dockerfile)
+
+It is designed for:
+
+- Ubuntu 24 Docker hosts
+- Docker Desktop on Apple Silicon or Intel Macs
+
+The image:
+
+- runs `voyo-shaka.ts`
+- starts `cdm.py` in the same container
+- builds `mp4decrypt` from pinned Bento4 source
+- downloads the official Shaka Packager Linux binary for the target architecture
+- caches Deno dependencies at build time, so normal container startup does not fetch code from the network
+
+### Docker quick start
+
+From the repo root:
+
+```sh
+cd /path/to/iptvro_v2-main
+mkdir -p v2/data
+cp v2/l3.wvd v2/data/l3.wvd
+cp v2/voyo.json v2/data/voyo.json
+docker compose -f v2/docker-compose.shaka.yaml up --build -d
+```
+
+If your `l3.wvd` and `voyo.json` live somewhere else, copy those files into `v2/data/` instead of the sample paths above.
+
+Check that the container is up:
+
+```sh
+docker compose -f v2/docker-compose.shaka.yaml ps
+docker compose -f v2/docker-compose.shaka.yaml logs -f
+```
+
+Basic HTTP checks:
+
+```sh
+curl -i http://127.0.0.1:8090/
+curl -i http://127.0.0.1:8090/vlc/channel-179/index.m3u8
+curl -u adm:fvoyo http://127.0.0.1:8090/api/stream/channel-179
+```
+
+Open:
+
+- UI: `http://localhost:8090/`
+- VLC: `http://localhost:8090/vlc/channel-179/index.m3u8`
+
+Stop the stack:
+
+```sh
+docker compose -f v2/docker-compose.shaka.yaml down
+```
+
+Rebuild from scratch after image changes:
+
+```sh
+docker compose -f v2/docker-compose.shaka.yaml up --build -d
+```
+
+Remove the stack and local image:
+
+```sh
+docker compose -f v2/docker-compose.shaka.yaml down --rmi local
+```
+
+Run on another host port, for example `8095`:
+
+```sh
+VOYO_HOST_PORT=8095 docker compose -f v2/docker-compose.shaka.yaml up --build -d
+```
+
+Run with custom UI credentials:
+
+```sh
+VOYO_UI_BASIC_AUTH_USER=myuser \
+VOYO_UI_BASIC_AUTH_PASS=mypass \
+docker compose -f v2/docker-compose.shaka.yaml up --build -d
+```
+
+### Docker notes
+
+- The container stores config and generated output under `/data`.
+- `VOYO_CDM_DEVICE` defaults to `/data/l3.wvd`.
+- The compose file publishes only port `8090`; the CDM sidecar stays internal to the container.
+- On Apple Silicon, the setup is intended to build and run natively as `linux/arm64`.
+
 `--allow-run` is only needed for experimental helper paths. The normal server works for non-DRM channels and the in-browser Shaka player.
 
 Or build a standalone binary (no Deno required at runtime):
@@ -80,11 +173,12 @@ VLC doesn't speak Widevine, but if you have a Widevine **L3** device file you ca
 2. resolve keys through `cdm.py`
 3. download rolling audio/video fragments
 4. decrypt them with `mp4decrypt`
-5. remux the local decrypted DASH view to HLS with `ffmpeg`
+5. feed decrypted audio/video into Shaka Packager
+6. serve Shaka-generated live HLS to VLC
 
 Capped at L3 quality (~720p on Voyo's mobile profile, which is what the headers in `voyo.ts` already pretend to be).
 
-You need: `ffmpeg`, `mp4decrypt` from Bento4, Python 3.10+, and an L3 `.wvd` device file (drop it next to the script as `l3.wvd`, or set `VOYO_CDM_DEVICE=/path/to/your.wvd`).
+You need: `mp4decrypt` from Bento4, Shaka Packager, Python 3.10+, and an L3 `.wvd` device file (drop it next to the script as `l3.wvd`, or set `VOYO_CDM_DEVICE=/path/to/your.wvd`).
 
 ```sh
 # one-time
@@ -118,7 +212,7 @@ Shaka variant:
 deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo-shaka.ts
 ```
 
-Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `http://<host>:8090/live.m3u8` to get every channel (DRM included). Two or more concurrent channels are fine — each gets its own ffmpeg, killed automatically after 60s of nobody pulling segments.
+Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `http://<host>:8090/live.m3u8` to get every channel (DRM included). Two or more concurrent channels are fine — each gets its own per-channel Shaka pipeline, cleaned up automatically after inactivity.
 
 **Knobs:**
 
@@ -127,7 +221,6 @@ Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `h
 | `VOYO_CDM_URL`  | `http://127.0.0.1:8091` | where `voyo.ts` looks for the sidecar |
 | `VOYO_CDM_PORT` | `8091`                  | sidecar listen port |
 | `VOYO_CDM_DEVICE` | `./l3.wvd`            | path to your L3 device file |
-| `VOYO_FFMPEG`   | `ffmpeg`                | ffmpeg binary path |
 | `VOYO_MP4DECRYPT` | `mp4decrypt`          | Bento4 `mp4decrypt` binary path |
 | `VOYO_SHAKA_PACKAGER` | `packager`         | Shaka Packager binary path for `voyo-shaka.ts` |
 | `VOYO_UI_BASIC_AUTH_USER` | `adm`          | UI/browser Basic Auth username for `voyo-shaka.ts` |
@@ -135,9 +228,9 @@ Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `h
 
 **Caveats:**
 - L1 (HD/4K) is intentionally not supported — would require a rooted-Android TEE proxy, not worth the operational pain. Stick with L3.
-- `mp4decrypt` is mandatory for the current VLC DRM path. On macOS you can usually install Bento4 and then point `VOYO_MP4DECRYPT` at the binary if it is not already on `PATH`.
+- `mp4decrypt` and Shaka Packager are mandatory for the current VLC DRM path.
 - The `.wvd` file is yours to provide — none ships here. `pip install pywidevine` then `pywidevine create-device -k private_key.pem -c client_id.bin -t ANDROID -l 3 -o .` if you have separate files.
-- `live/` (transient HLS chunks) is git-ignored; it's recreated under the config dir at runtime.
+- `live-shaka/` (transient Shaka output) is git-ignored; it's recreated under the config dir at runtime.
 
 ## OBS — 2 channels, separate audio, 2 platforms
 
