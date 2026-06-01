@@ -127,7 +127,7 @@ class RestartCooldownError extends HttpError {
 }
 
 function isUiProtectedRoute(path: string, method: string): boolean {
-  if (method === "GET" && (path === "/" || path === "/mosaic" || path === "/proxy")) return true;
+  if (method === "GET" && (path === "/" || path === "/mosaic")) return true;
   if (method === "POST" && path === "/api/login") return true;
   if (method === "POST" && path === "/api/events") return true;
   if (method === "DELETE" && path.startsWith("/api/events/")) return true;
