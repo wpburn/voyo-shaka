@@ -2185,7 +2185,11 @@ async function handle(req: Request): Promise<Response> {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
       if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
-      if (filename === "index.m3u8") await ensureDrmState(ch.id);
+      if (filename === "index.m3u8") {
+        const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
+        if (!info.isDrm) return await buildLivePlaylist(ch.id, url.origin);
+        await ensureDrmState(ch.id);
+      }
       return await serveDrmOutputFile(ch.id, filename);
     } catch (e) {
       console.error(`[vlc] ${requested}/${filename}:`, (e as Error).message);
