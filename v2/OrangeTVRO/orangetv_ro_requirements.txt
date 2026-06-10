@@ -1,0 +1,23 @@
+# OrangeTVRo.py runtime dependencies
+# Recommended Python: 3.11 (3.12+ removes distutils which breaks parts of the
+# o11 toolchain).
+
+# Networking — provides curl_cffi-backed sessions via o11.session()
+curl_cffi>=0.7.0
+
+# HTML/XML parsing
+#   - lxml: parses the MPD (XML) and the Orange OAuth login page (HTML)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Widevine CDM operations (cdm=external path)
+# pywidevine pulls in pycryptodome — do NOT also install pycrypto, the
+# namespace clash will break Cdm.from_device().
+pywidevine>=1.8.0
+pycryptodome>=3.19.0
+
+# stdlib: secrets, string, base64, json, os, sys, urllib.parse
+
+# o11 panel framework module is provided by the panel itself and is NOT a
+# pip package. It must be importable from the same directory the script
+# runs in (typically the panel's scripts/ folder).

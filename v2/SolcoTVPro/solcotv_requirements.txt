@@ -1,0 +1,25 @@
+# SolcoTV.py runtime dependencies
+# One script covers eight Solocoo-powered services. Platform is selected via
+# solcotv_config.json (or platform= argv override).
+# Recommended Python: 3.11 (3.12+ removes distutils which breaks parts of the
+# o11 toolchain).
+
+# Networking — provides curl_cffi-backed sessions via o11.session()
+curl_cffi>=0.7.0
+
+# HTML/XML parsing (PSSH extraction from DASH manifest)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Widevine CDM operations (cdm=external path)
+# pywidevine pulls in pycryptodome — do NOT also install pycrypto, the
+# namespace clash will break Cdm.from_device().
+pywidevine>=1.8.0
+pycryptodome>=3.19.0
+
+# stdlib: hashlib, hmac, secrets, datetime, base64, string, json, os, sys
+# (Solocoo signature scheme requires only stdlib crypto primitives.)
+
+# o11 panel framework module is provided by the panel itself and is NOT a
+# pip package. It must be importable from the same directory the script
+# runs in (typically the panel's scripts/ folder).
