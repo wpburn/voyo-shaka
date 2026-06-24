@@ -1,0 +1,17 @@
+.env
+.env.*
+data/
+live/
+logs/
+session.json
+channels.json
+*.json.tmp
+*.wvd
+*.tokens
+*.cache
+*.log
+*.m4s
+*.mp4
+*.mpd
+*.m3u8
+*.pipe
