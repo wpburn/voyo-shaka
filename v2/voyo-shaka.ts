@@ -875,6 +875,7 @@ function buildSegmentsFromTemplate(
   bandwidth: number,
   baseUrl: string,
   timeShiftBufferDepthMs: number | null,
+  periodElapsedMs: number | null,
 ): { timescale: number; initUrl: string; segments: ParsedSegment[] } | null {
   const initialization = templateAttrs.initialization;
   const media = templateAttrs.media;
@@ -892,11 +893,13 @@ function buildSegmentsFromTemplate(
     const segmentCount = timeShiftBufferDepthMs != null
       ? Math.min(PIPE_SEGMENT_WINDOW, Math.max(1, Math.floor(timeShiftBufferDepthMs / durationMs)))
       : PIPE_SEGMENT_WINDOW;
+    const liveOffset = periodElapsedMs != null ? Math.max(0, Math.floor(periodElapsedMs / durationMs)) : segmentCount - 1;
+    const firstNumber = startNumber + Math.max(0, liveOffset - segmentCount + 1);
     return {
       timescale,
       initUrl,
       segments: Array.from({ length: segmentCount }, (_, index) => {
-        const number = startNumber + index;
+        const number = firstNumber + index;
         return {
           id: `n-${number}`,
           url: new URL(fillTemplate(media, representationId, bandwidth, number, null), baseUrl).toString(),
@@ -937,6 +940,7 @@ function resolveRepresentation(
   adaptation: { attrs: Record<string, string>; inner: string },
   baseUrl: string,
   timeShiftBufferDepthMs: number | null,
+  periodElapsedMs: number | null,
 ): ParsedRepresentation | null {
   const repAttrs = representation.attrs;
   const adaptAttrs = adaptation.attrs;
@@ -961,6 +965,7 @@ function resolveRepresentation(
       bandwidth,
       resolvedBase,
       timeShiftBufferDepthMs,
+      periodElapsedMs,
     )
     : null;
   const fromList = fromTemplate ??
@@ -1001,6 +1006,12 @@ function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
   const baseUrl = mpdBase ? new URL(mpdBase, mpdUrl).toString() : mpdUrl;
   const period = findXmlBlocks(xml, "Period")[0];
   if (!period) throw new Error("MPD has no Period");
+  const availabilityStartTimeMs = Date.parse(mpdAttrs.availabilityStartTime ?? "");
+  const publishTimeMs = Date.parse(mpdAttrs.publishTime ?? "");
+  const periodStartMs = parseIsoDurationMs(period.attrs.start) ?? 0;
+  const periodElapsedMs = Number.isFinite(availabilityStartTimeMs) && Number.isFinite(publishTimeMs)
+    ? Math.max(0, publishTimeMs - availabilityStartTimeMs - periodStartMs)
+    : null;
   const periodBase = findXmlText(period.inner, "BaseURL");
   const resolvedPeriodBase = periodBase ? new URL(periodBase, baseUrl).toString() : baseUrl;
 
@@ -1021,6 +1032,7 @@ function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
         adaptation,
         resolvedAdaptationBase,
         timeShiftBufferDepthMs,
+        periodElapsedMs,
       );
       if (!parsed || parsed.segments.length === 0) continue;
       (kind === "audio" ? audio : video).push(parsed);
