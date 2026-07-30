@@ -874,6 +874,7 @@ function buildSegmentsFromTemplate(
   representationId: string,
   bandwidth: number,
   baseUrl: string,
+  timeShiftBufferDepthMs: number | null,
 ): { timescale: number; initUrl: string; segments: ParsedSegment[] } | null {
   const initialization = templateAttrs.initialization;
   const media = templateAttrs.media;
@@ -884,7 +885,28 @@ function buildSegmentsFromTemplate(
   const mediaUsesTime = /\$Time(?:%0\d+d)?\$/.test(media);
   const initUrl = new URL(fillTemplate(initialization, representationId, bandwidth, startNumber, null), baseUrl).toString();
   const timeline = parseSegmentTimeline(templateInner);
-  if (timeline.length === 0) return null;
+  if (timeline.length === 0) {
+    const duration = Number(templateAttrs.duration ?? "");
+    if (!mediaUsesNumber || !Number.isFinite(duration) || duration <= 0) return null;
+    const durationMs = duration / timescale * 1000;
+    const segmentCount = timeShiftBufferDepthMs != null
+      ? Math.min(PIPE_SEGMENT_WINDOW, Math.max(1, Math.floor(timeShiftBufferDepthMs / durationMs)))
+      : PIPE_SEGMENT_WINDOW;
+    return {
+      timescale,
+      initUrl,
+      segments: Array.from({ length: segmentCount }, (_, index) => {
+        const number = startNumber + index;
+        return {
+          id: `n-${number}`,
+          url: new URL(fillTemplate(media, representationId, bandwidth, number, null), baseUrl).toString(),
+          number,
+          time: null,
+          duration,
+        };
+      }),
+    };
+  }
   const segments: ParsedSegment[] = [];
   let segmentNumber = startNumber;
   let currentTime = timeline[0]?.time ?? 0;
@@ -914,6 +936,7 @@ function resolveRepresentation(
   representation: { attrs: Record<string, string>; inner: string },
   adaptation: { attrs: Record<string, string>; inner: string },
   baseUrl: string,
+  timeShiftBufferDepthMs: number | null,
 ): ParsedRepresentation | null {
   const repAttrs = representation.attrs;
   const adaptAttrs = adaptation.attrs;
@@ -931,7 +954,14 @@ function resolveRepresentation(
   const mergedTemplateAttrs = { ...(adaptTemplate?.attrs ?? {}), ...(repTemplate?.attrs ?? {}) };
   const templateInner = repTemplate?.inner || adaptTemplate?.inner || "";
   const fromTemplate = Object.keys(mergedTemplateAttrs).length > 0
-    ? buildSegmentsFromTemplate(mergedTemplateAttrs, templateInner, representationId, bandwidth, resolvedBase)
+    ? buildSegmentsFromTemplate(
+      mergedTemplateAttrs,
+      templateInner,
+      representationId,
+      bandwidth,
+      resolvedBase,
+      timeShiftBufferDepthMs,
+    )
     : null;
   const fromList = fromTemplate ??
     parseSegmentList(
@@ -966,6 +996,7 @@ function resolveRepresentation(
 function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
   const mpdOpen = /<MPD\b([^>]*)>/i.exec(xml);
   const mpdAttrs = mpdOpen ? parseXmlAttributes(mpdOpen[1]) : {};
+  const timeShiftBufferDepthMs = parseIsoDurationMs(mpdAttrs.timeShiftBufferDepth);
   const mpdBase = findXmlText(xml, "BaseURL");
   const baseUrl = mpdBase ? new URL(mpdBase, mpdUrl).toString() : mpdUrl;
   const period = findXmlBlocks(xml, "Period")[0];
@@ -984,7 +1015,13 @@ function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
     const adaptationBase = findXmlText(adaptation.inner, "BaseURL");
     const resolvedAdaptationBase = adaptationBase ? new URL(adaptationBase, resolvedPeriodBase).toString() : resolvedPeriodBase;
     for (const representation of findXmlBlocks(adaptation.inner, "Representation")) {
-      const parsed = resolveRepresentation(kind, representation, adaptation, resolvedAdaptationBase);
+      const parsed = resolveRepresentation(
+        kind,
+        representation,
+        adaptation,
+        resolvedAdaptationBase,
+        timeShiftBufferDepthMs,
+      );
       if (!parsed || parsed.segments.length === 0) continue;
       (kind === "audio" ? audio : video).push(parsed);
     }
