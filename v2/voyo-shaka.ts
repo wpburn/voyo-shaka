@@ -1173,7 +1173,10 @@ async function ensureTrackInitPrepared(state: DrmChannelState, track: TrackRunti
 }
 
 function isExpiredStreamError(error: unknown): boolean {
-  return error instanceof HttpError && (error.status === 401 || error.status === 403);
+  // 404 covers expired signed segment URLs and segments that rolled off the
+  // live window between the manifest fetch and the download.
+  return error instanceof HttpError &&
+    (error.status === 401 || error.status === 403 || error.status === 404);
 }
 
 async function refreshDrmState(state: DrmChannelState, force = false): Promise<void> {
@@ -1353,14 +1356,8 @@ function outputPathFor(state: DrmChannelState, relativePath: string): string | n
   return `${state.dirs.out}/${clean.join("/")}`;
 }
 
-async function syncDrmStateOnce(state: DrmChannelState): Promise<boolean> {
-  try {
-    await refreshDrmState(state);
-  } catch (error) {
-    if (!isExpiredStreamError(error)) throw error;
-    await logState(state, "stream URL expired; refreshing signed manifest");
-    await refreshDrmState(state, true);
-  }
+async function runSyncCycle(state: DrmChannelState, forceRefresh: boolean): Promise<boolean> {
+  await refreshDrmState(state, forceRefresh);
   if (!state.audio || !state.video || !state.audioWriter || !state.videoWriter) {
     throw new Error("DRM state is not fully initialized");
   }
@@ -1369,6 +1366,17 @@ async function syncDrmStateOnce(state: DrmChannelState): Promise<boolean> {
   await feedTrack(state, state.audio, state.audioWriter);
   await feedTrack(state, state.video, state.videoWriter);
   return audioProgress || videoProgress;
+}
+
+async function syncDrmStateOnce(state: DrmChannelState): Promise<boolean> {
+  try {
+    return await runSyncCycle(state, false);
+  } catch (error) {
+    if (!isExpiredStreamError(error)) throw error;
+    const status = (error as HttpError).status;
+    await logState(state, `upstream ${status}; force-refreshing stream info and retrying sync once`);
+    return await runSyncCycle(state, true);
+  }
 }
 
 async function disposeState(state: DrmChannelState, reason: string, cleanupDir = true): Promise<void> {
@@ -2238,6 +2246,24 @@ async function handle(req: Request): Promise<Response> {
         const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
         if (!info.isDrm) return await buildLivePlaylist(ch.id, url.origin);
         await ensureDrmState(ch.id);
+        return await serveDrmOutputFile(ch.id, filename);
+      }
+      // Child playlists self-heal so clients polling only audio.m3u8/video.m3u8
+      // recover after a rebuild instead of looping on 404. With a live pipeline,
+      // serve from disk first — no upstream lookups on the healthy path. Without
+      // one (torn down, or stale files left by a failed cleanup), restart it
+      // before serving, keeping the non-DRM guard on this cold path only.
+      if (filename.endsWith(".m3u8")) {
+        const pipelineAlive = drmStates.has(ch.id) || drmStateStarts.has(ch.id);
+        if (!pipelineAlive) {
+          const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
+          if (info.isDrm) await ensureDrmState(ch.id);
+          return await serveDrmOutputFile(ch.id, filename);
+        }
+        const res = await serveDrmOutputFile(ch.id, filename);
+        if (res.status !== 404) return res;
+        await ensureDrmState(ch.id);
+        return await serveDrmOutputFile(ch.id, filename);
       }
       return await serveDrmOutputFile(ch.id, filename);
     } catch (e) {
