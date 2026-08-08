@@ -9,6 +9,7 @@ type DigiOnlineConfig = {
   mp4decrypt: string;
   shakaPackager: string;
   dataDir: string;
+  requestTimeoutMs: number;
 };
 type SessionState = {
   deviceId: string;
@@ -218,6 +219,8 @@ const config: DigiOnlineConfig = {
     env("DIGI_ONLINE_SHAKA_PACKAGER", "packager"),
   ),
   dataDir: resolvePath(env("DIGI_ONLINE_DATA_DIR", "./data")),
+  requestTimeoutMs: Number(env("DIGI_ONLINE_REQUEST_TIMEOUT_MS", "15000")) ||
+    15000,
 };
 
 const SESSION_PATH = `${config.dataDir}/session.json`;
@@ -460,6 +463,26 @@ function log(message: string): void {
   console.log(`[digi-online] ${redact(message)}`);
 }
 
+async function fetchWithTimeout(
+  input: string | URL | Request,
+  init: RequestInit = {},
+  label = "request",
+  timeoutMs = config.requestTimeoutMs,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new HttpError(504, `${label} timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function ensureDir(path: string): Promise<void> {
   await Deno.mkdir(path, { recursive: true });
 }
@@ -528,7 +551,10 @@ async function performLogin(): Promise<SessionState> {
   loginUrl.searchParams.set("action", "registerUser");
   loginUrl.searchParams.set("user", username);
   loginUrl.searchParams.set("pass", passwordHash);
-  const loginRes = await fetch(loginUrl, { headers: digiHeaders() });
+  log("calling Digi registerUser");
+  const loginRes = await fetchWithTimeout(loginUrl, {
+    headers: digiHeaders(),
+  }, "Digi registerUser");
   const login = await readResponseJson(loginRes);
   const loginError = providerError(loginRes, login.data, login.rawBody);
   if (loginError) throw loginError;
@@ -550,7 +576,10 @@ async function performLogin(): Promise<SessionState> {
   registerUrl.searchParams.set("dma", DEVICE_MAKER);
   registerUrl.searchParams.set("o", DEVICE_OS);
   registerUrl.searchParams.set("user", username);
-  const registerRes = await fetch(registerUrl, { headers: digiHeaders() });
+  log("calling Digi registerDevice");
+  const registerRes = await fetchWithTimeout(registerUrl, {
+    headers: digiHeaders(),
+  }, "Digi registerDevice");
   const register = await readResponseJson(registerRes);
   const registerError = providerError(
     registerRes,
@@ -642,9 +671,13 @@ function normalizeChannel(raw: Json): DigiOnlineChannel | null {
 }
 
 async function fetchChannels(): Promise<DigiOnlineChannel[]> {
-  const res = await fetch(`${DIGI_API_BASE}/categorieschannels.php`, {
-    headers: digiHeaders(),
-  });
+  const res = await fetchWithTimeout(
+    `${DIGI_API_BASE}/categorieschannels.php`,
+    {
+      headers: digiHeaders(),
+    },
+    "Digi channel catalog",
+  );
   const { data, rawBody } = await readResponseJson(res);
   if (!res.ok) {
     throw new HttpError(
@@ -708,7 +741,9 @@ async function resolveStream(
     url.searchParams.set("s", STREAM_SOURCE);
     url.searchParams.set("quality", STREAM_QUALITY);
     url.searchParams.set("iosStream", "1");
-    const res = await fetch(url, { headers: digiHeaders() });
+    const res = await fetchWithTimeout(url, {
+      headers: digiHeaders(),
+    }, "Digi stream");
     const { data, rawBody } = await readResponseJson(res);
     if (!res.ok) {
       throw new HttpError(
@@ -1106,7 +1141,9 @@ function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
 async function fetchMpd(
   mpdUrl: string,
 ): Promise<{ xml: string; parsed: ParsedMpd }> {
-  const res = await fetch(mpdUrl, { headers: mediaHeaders() });
+  const res = await fetchWithTimeout(mpdUrl, {
+    headers: mediaHeaders(),
+  }, "MPD fetch");
   if (!res.ok) {
     throw new HttpError(res.status, `MPD fetch failed: HTTP ${res.status}`);
   }
@@ -1144,7 +1181,7 @@ async function getKeys(
   const pssh = extractPssh(mpd.xml);
   let res: Response;
   try {
-    res = await fetch(`${config.cdmUrl}/keys`, {
+    res = await fetchWithTimeout(`${config.cdmUrl}/keys`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1152,7 +1189,7 @@ async function getKeys(
         licenseUrl: info.drm.licenseUrl,
         headers: info.drm.headers,
       }),
-    });
+    }, "CDM key extraction");
   } catch (e) {
     throw new Error(
       `CDM sidecar unreachable at ${config.cdmUrl}: ${(e as Error).message}`,
@@ -1222,7 +1259,9 @@ function mergeTrack(
 }
 
 async function downloadToFile(url: string, path: string): Promise<void> {
-  const res = await fetch(url, { headers: mediaHeaders() });
+  const res = await fetchWithTimeout(url, {
+    headers: mediaHeaders(),
+  }, "fragment download");
   if (!res.ok) {
     throw new HttpError(
       res.status,
@@ -1268,7 +1307,7 @@ async function ensureCdm(): Promise<void> {
   if (cdmChecked) return;
   let res: Response;
   try {
-    res = await fetch(`${config.cdmUrl}/health`);
+    res = await fetchWithTimeout(`${config.cdmUrl}/health`, {}, "CDM health");
   } catch (e) {
     throw new Error(
       `CDM sidecar unreachable at ${config.cdmUrl}: ${(e as Error).message}`,
@@ -1940,21 +1979,21 @@ async function handle(req: Request): Promise<Response> {
       const challenge = await req.arrayBuffer();
       let info = await resolveStream(channel.id);
       if (!info.drm) return new Response("channel is not DRM", { status: 400 });
-      let upstream = await fetch(info.drm.licenseUrl, {
+      let upstream = await fetchWithTimeout(info.drm.licenseUrl, {
         method: "POST",
         headers: info.drm.headers,
         body: challenge,
-      });
+      }, "Digi license proxy");
       if (upstream.status === 401 || upstream.status === 403) {
         info = await resolveStream(channel.id, true);
         if (!info.drm) {
           return new Response("channel is not DRM", { status: 400 });
         }
-        upstream = await fetch(info.drm.licenseUrl, {
+        upstream = await fetchWithTimeout(info.drm.licenseUrl, {
           method: "POST",
           headers: info.drm.headers,
           body: challenge,
-        });
+        }, "Digi license proxy refresh");
       }
       return new Response(upstream.body, {
         status: upstream.status,
@@ -2066,7 +2105,9 @@ async function handle(req: Request): Promise<Response> {
     const target = url.searchParams.get("url");
     if (!target) return new Response("missing url", { status: 400 });
     try {
-      const upstream = await fetch(target, { headers: mediaHeaders(req) });
+      const upstream = await fetchWithTimeout(target, {
+        headers: mediaHeaders(req),
+      }, "media proxy");
       const headers = new Headers();
       for (
         const name of [
