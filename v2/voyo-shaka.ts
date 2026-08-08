@@ -8,6 +8,7 @@
 //          • GET /play/:id, /mosaic       — in-browser Shaka players (Chrome Widevine)
 //          • GET /proxy?url=              — generic CORS/header passthrough used by /live
 
+// deno-lint-ignore no-unversioned-import
 import { crypto as stdCrypto } from "jsr:@std/crypto/crypto";
 
 // === Types ===
@@ -23,9 +24,17 @@ type Channel = {
   lastCheckedAt?: string | null;
   lastError?: string | null;
 };
-type StreamInfo = { url: string; isDrm: boolean; drm?: { url: string; headers: Record<string, string> } };
+type StreamInfo = {
+  url: string;
+  isDrm: boolean;
+  drm?: { url: string; headers: Record<string, string> };
+};
 type Creds = { username: string; password: string };
-type Session = { token: string | null; uuid: string | null; issuedAt: string | null };
+type Session = {
+  token: string | null;
+  uuid: string | null;
+  issuedAt: string | null;
+};
 type Config = {
   credentials: Creds;
   session: Session;
@@ -34,8 +43,21 @@ type Config = {
   channelsUpdatedAt: string | null;
 };
 
-const VOYO_CONTENT_TYPES = ["show", "tvshow", "movie", "episode", "trailer", "bonus", "channel", "livechannel", "live"] as const;
-const VOYO_TYPED_CONTENT_ID_RE = new RegExp(`^(${VOYO_CONTENT_TYPES.join("|")})([.-])(\\d+)$`, "i");
+const VOYO_CONTENT_TYPES = [
+  "show",
+  "tvshow",
+  "movie",
+  "episode",
+  "trailer",
+  "bonus",
+  "channel",
+  "livechannel",
+  "live",
+] as const;
+const VOYO_TYPED_CONTENT_ID_RE = new RegExp(
+  `^(${VOYO_CONTENT_TYPES.join("|")})([.-])(\\d+)$`,
+  "i",
+);
 const VOYO_URL_TYPE_MAP: Record<string, typeof VOYO_CONTENT_TYPES[number]> = {
   "episodul": "episode",
   "episode": "episode",
@@ -60,7 +82,9 @@ const PORT = Number(Deno.env.get("VOYO_PORT") ?? 8090);
 
 function resolveExecutable(command: string): string {
   if (!command.includes("/")) return command;
-  return command.startsWith("/") ? command : `${Deno.cwd()}/${command}`.replaceAll("/./", "/");
+  return command.startsWith("/")
+    ? command
+    : `${Deno.cwd()}/${command}`.replaceAll("/./", "/");
 }
 
 function defaultConfigDir(): string {
@@ -80,10 +104,13 @@ const LEGACY_CONFIG_PATH = `${CONFIG_DIR}/../configs/voyo.json`;
 const API_BASE = "https://apivoyo.cms.protvplus.ro";
 const AUTH_REFRESH_MS = 6 * 60 * 60 * 1000;
 const CHANNELS_REFRESH_MS = 12 * 60 * 60 * 1000;
-const SALT_B64 = "ZGtkZjM1ZzYhIHtjb250ZW50fXxwbGF5c3xuZzhyNWUzMSF8e3NlcnZlclRpbWV9ISNpM2R0JjQzQA==";
+const SALT_B64 =
+  "ZGtkZjM1ZzYhIHtjb250ZW50fXxwbGF5c3xuZzhyNWUzMSF8e3NlcnZlclRpbWV9ISNpM2R0JjQzQA==";
 const UI_BASIC_AUTH_USER = Deno.env.get("VOYO_UI_BASIC_AUTH_USER") ?? "adm";
 const UI_BASIC_AUTH_PASS = Deno.env.get("VOYO_UI_BASIC_AUTH_PASS") ?? "fvoyo";
-const PRESERVE_LIVE_DIR = /^(1|true|yes)$/i.test(Deno.env.get("VOYO_PRESERVE_LIVE_DIR") ?? "");
+const PRESERVE_LIVE_DIR = /^(1|true|yes)$/i.test(
+  Deno.env.get("VOYO_PRESERVE_LIVE_DIR") ?? "",
+);
 
 function deviceHeaders(uuid: string, token?: string): Record<string, string> {
   const h: Record<string, string> = {
@@ -107,11 +134,15 @@ function deviceHeaders(uuid: string, token?: string): Record<string, string> {
 }
 
 function toHex(buf: ArrayBuffer): string {
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function slugify(name: string): string {
-  return name.normalize("NFKD").replace(/[^\w]/g, " ").trim().replaceAll(" ", "-").replace("--", "-").toLowerCase();
+  return name.normalize("NFKD").replace(/[^\w]/g, " ").trim().replaceAll(
+    " ",
+    "-",
+  ).replace("--", "-").toLowerCase();
 }
 
 class HttpError extends Error {
@@ -131,12 +162,19 @@ function isUiProtectedRoute(path: string, method: string): boolean {
   if (method === "POST" && path === "/api/login") return true;
   if (method === "POST" && path === "/api/events") return true;
   if (method === "DELETE" && path.startsWith("/api/events/")) return true;
-  if (method === "GET" && (path.startsWith("/play/") || path.startsWith("/api/channels") || path.startsWith("/api/stream/"))) {
+  if (
+    method === "GET" &&
+    (path.startsWith("/play/") || path.startsWith("/api/channels") ||
+      path.startsWith("/api/stream/"))
+  ) {
     return true;
   }
-  if (method === "GET" &&
-    (path.startsWith("/api/keys/") || path.startsWith("/api/drm-state/") || path.startsWith("/api/drm-manifest/") ||
-      path.startsWith("/api/drm-log/"))) {
+  if (
+    method === "GET" &&
+    (path.startsWith("/api/keys/") || path.startsWith("/api/drm-state/") ||
+      path.startsWith("/api/drm-manifest/") ||
+      path.startsWith("/api/drm-log/"))
+  ) {
     return true;
   }
   return false;
@@ -179,7 +217,10 @@ async function login(creds: Creds): Promise<{ token: string; uuid: string }> {
   });
   const data = await res.json().catch(() => ({}));
   if (!data?.credentials?.accessToken) {
-    throw new HttpError(res.status, `login failed: ${data?.message ?? res.status}`);
+    throw new HttpError(
+      res.status,
+      `login failed: ${data?.message ?? res.status}`,
+    );
   }
   return { token: data.credentials.accessToken, uuid };
 }
@@ -190,7 +231,9 @@ async function listChannels(token: string, uuid: string): Promise<Channel[]> {
   });
   if (!res.ok) throw new HttpError(res.status, `channels: ${res.status}`);
   const data = await res.json();
-  return (data.liveTvs ?? []).map((c: { id: string; name: string; logo?: string }) => ({
+  return (data.liveTvs ?? []).map((
+    c: { id: string; name: string; logo?: string },
+  ) => ({
     id: c.id,
     name: c.name,
     img: c.logo?.replace("{WIDTH}x{HEIGHT}", "1920x1080") ?? "",
@@ -198,14 +241,23 @@ async function listChannels(token: string, uuid: string): Promise<Channel[]> {
   }));
 }
 
-async function resolveStream(channelId: string, token: string, uuid: string): Promise<StreamInfo> {
+async function resolveStream(
+  channelId: string,
+  token: string,
+  uuid: string,
+): Promise<StreamInfo> {
   const headers = deviceHeaders(uuid, token);
   const tRes = await fetch(`${API_BASE}/api/v1/server/time`, { headers });
   if (!tRes.ok) throw new HttpError(tRes.status, `server/time: ${tRes.status}`);
   const { localTime, encoded } = await tRes.json();
 
-  const salt = atob(SALT_B64).replace("{content}", channelId).replace("{serverTime}", localTime);
-  const hash = toHex(await stdCrypto.subtle.digest("MD5", new TextEncoder().encode(salt)));
+  const salt = atob(SALT_B64).replace("{content}", channelId).replace(
+    "{serverTime}",
+    localTime,
+  );
+  const hash = toHex(
+    await stdCrypto.subtle.digest("MD5", new TextEncoder().encode(salt)),
+  );
 
   const url =
     `${API_BASE}/api/v1/content/${channelId}/plays?acceptVideo=hls%2Cdai%2Cdash%2Cdrm-widevine&t=${encoded}&s=${hash}`;
@@ -220,7 +272,10 @@ async function resolveStream(channelId: string, token: string, uuid: string): Pr
     info.drm = {
       url: data.drm.licenseUrl,
       headers: (data.drm.licenseRequestHeaders ?? []).reduce(
-        (acc: Record<string, string>, { name, value }: { name: string; value: string }) => ({ ...acc, [name]: value }),
+        (
+          acc: Record<string, string>,
+          { name, value }: { name: string; value: string },
+        ) => ({ ...acc, [name]: value }),
         {},
       ),
     };
@@ -255,7 +310,8 @@ function extractNumericContentTail(value: string): string | null {
 }
 
 function inferEventContentId(value: string): string {
-  return normalizeTypedContentId(value) ?? `episode.${extractNumericContentTail(value) ?? value.trim()}`;
+  return normalizeTypedContentId(value) ??
+    `episode.${extractNumericContentTail(value) ?? value.trim()}`;
 }
 
 function publicContentRouteId(value: string): string {
@@ -265,15 +321,23 @@ function publicContentRouteId(value: string): string {
   return match ? `${match[1].toLowerCase()}-${match[3]}` : value.trim();
 }
 
-function publicRoutePathFor(channel: Pick<Channel, "id" | "contentId" | "kind">): string {
-  const normalized = channel.kind === "event" && channel.contentId ? normalizeTypedContentId(channel.contentId) : null;
+function publicRoutePathFor(
+  channel: Pick<Channel, "id" | "contentId" | "kind">,
+): string {
+  const normalized = channel.kind === "event" && channel.contentId
+    ? normalizeTypedContentId(channel.contentId)
+    : null;
   const match = normalized ? VOYO_TYPED_CONTENT_ID_RE.exec(normalized) : null;
   return match ? `${match[1].toLowerCase()}/${match[3]}` : channel.id;
 }
 
-function contentRouteAliases(channel: Pick<Channel, "id" | "contentId">): string[] {
+function contentRouteAliases(
+  channel: Pick<Channel, "id" | "contentId">,
+): string[] {
   const aliases = new Set<string>([channel.id]);
-  const normalized = channel.contentId ? normalizeTypedContentId(channel.contentId) : null;
+  const normalized = channel.contentId
+    ? normalizeTypedContentId(channel.contentId)
+    : null;
   if (normalized) {
     aliases.add(normalized);
     aliases.add(publicContentRouteId(normalized));
@@ -284,13 +348,22 @@ function contentRouteAliases(channel: Pick<Channel, "id" | "contentId">): string
 function normalizeRequestedContentKey(value: string): string {
   const decoded = decodeURIComponent(value.trim());
   const routeMatch = /^([a-z]+)\/(\d+)$/i.exec(decoded);
-  if (routeMatch && VOYO_CONTENT_TYPES.includes(routeMatch[1].toLowerCase() as typeof VOYO_CONTENT_TYPES[number])) {
+  if (
+    routeMatch &&
+    VOYO_CONTENT_TYPES.includes(
+      routeMatch[1].toLowerCase() as typeof VOYO_CONTENT_TYPES[number],
+    )
+  ) {
     return `${routeMatch[1].toLowerCase()}.${routeMatch[2]}`;
   }
   return normalizeTypedContentId(decoded) ?? decoded;
 }
 
-function parseVoyoUrlContent(url: URL): { type: typeof VOYO_CONTENT_TYPES[number]; rawId: string; slug: string } | null {
+function parseVoyoUrlContent(
+  url: URL,
+):
+  | { type: typeof VOYO_CONTENT_TYPES[number]; rawId: string; slug: string }
+  | null {
   const match = /\/([^/]+)\/(\d+)(?:-([^/?#]+))?/i.exec(url.pathname);
   if (!match) return null;
   const type = VOYO_URL_TYPE_MAP[match[1].toLowerCase()];
@@ -341,7 +414,11 @@ function parseManualEventInput(input: string): Channel {
     throw new Error("invalid URL");
   }
   const parsedUrl = parseVoyoUrlContent(url);
-  if (!parsedUrl) throw new Error("unsupported Voyo URL path; use a typed ID like episode-134030");
+  if (!parsedUrl) {
+    throw new Error(
+      "unsupported Voyo URL path; use a typed ID like episode-134030",
+    );
+  }
   const contentId = `${parsedUrl.type}.${parsedUrl.rawId}`;
   const routeId = publicContentRouteId(contentId);
   const slug = parsedUrl.slug ? `event-${parsedUrl.slug}` : `event-${routeId}`;
@@ -370,7 +447,10 @@ async function fetchPublicPageMeta(pageUrl: string): Promise<Partial<Channel>> {
   if (!res.ok) return {};
   const html = await res.text();
   const metaContent = (property: string) =>
-    new RegExp(`<meta[^>]+(?:property|name)="${property}"[^>]+content="([^"]+)"`, "i").exec(html)?.[1] ?? null;
+    new RegExp(
+      `<meta[^>]+(?:property|name)="${property}"[^>]+content="([^"]+)"`,
+      "i",
+    ).exec(html)?.[1] ?? null;
   const title = metaContent("og:title") ?? metaContent("twitter:title");
   const image = metaContent("og:image") ?? metaContent("twitter:image");
   return {
@@ -379,14 +459,20 @@ async function fetchPublicPageMeta(pageUrl: string): Promise<Partial<Channel>> {
   };
 }
 
-function contentIdFor(channel: Pick<Channel, "id" | "contentId"> | string): string {
-  return typeof channel === "string" ? channel : channel.contentId ?? channel.id;
+function contentIdFor(
+  channel: Pick<Channel, "id" | "contentId"> | string,
+): string {
+  return typeof channel === "string"
+    ? channel
+    : channel.contentId ?? channel.id;
 }
 
 async function probeStreamKind(
   cacheKey: string,
   contentId = cacheKey,
-): Promise<{ streamKind: "drm" | "hls" | "unknown"; lastError: string | null }> {
+): Promise<
+  { streamKind: "drm" | "hls" | "unknown"; lastError: string | null }
+> {
   try {
     const info = await getStreamInfo(cacheKey, true, contentId);
     return { streamKind: info.isDrm ? "drm" : "hls", lastError: null };
@@ -403,26 +489,39 @@ const streamRefreshes = new Map<string, Promise<StreamInfo>>();
 
 function isTemporaryStreamRefreshError(error: unknown): boolean {
   if (!(error instanceof HttpError)) return true;
-  return error.status === 401 || error.status === 403 || error.status === 429 || error.status >= 500;
+  return error.status === 401 || error.status === 403 || error.status === 429 ||
+    error.status >= 500;
 }
 
-function refreshStreamInfo(cacheKey: string, contentId: string): Promise<StreamInfo> {
+function refreshStreamInfo(
+  cacheKey: string,
+  contentId: string,
+): Promise<StreamInfo> {
   const inFlight = streamRefreshes.get(cacheKey);
   if (inFlight) return inFlight;
 
   const refresh = withAuth((t, u) => resolveStream(contentId, t, u))
     .then((info) => {
-      streamCache.set(cacheKey, { info, expiresAt: Date.now() + STREAM_TTL_MS });
+      streamCache.set(cacheKey, {
+        info,
+        expiresAt: Date.now() + STREAM_TTL_MS,
+      });
       return info;
     })
     .finally(() => {
-      if (streamRefreshes.get(cacheKey) === refresh) streamRefreshes.delete(cacheKey);
+      if (streamRefreshes.get(cacheKey) === refresh) {
+        streamRefreshes.delete(cacheKey);
+      }
     });
   streamRefreshes.set(cacheKey, refresh);
   return refresh;
 }
 
-async function getStreamInfo(cacheKey: string, force = false, contentId = cacheKey): Promise<StreamInfo> {
+async function getStreamInfo(
+  cacheKey: string,
+  force = false,
+  contentId = cacheKey,
+): Promise<StreamInfo> {
   const hit = streamCache.get(cacheKey);
   if (!force && hit && hit.expiresAt > Date.now()) return hit.info;
 
@@ -433,7 +532,10 @@ async function getStreamInfo(cacheKey: string, force = false, contentId = cacheK
       const now = Date.now();
       if (hit.expiresAt <= now) {
         hit.expiresAt = now + STREAM_REFRESH_RETRY_MS;
-        console.warn(`[stream-cache] refresh failed for ${cacheKey}; using cached stream:`, (error as Error).message);
+        console.warn(
+          `[stream-cache] refresh failed for ${cacheKey}; using cached stream:`,
+          (error as Error).message,
+        );
       }
       return hit.info;
     }
@@ -445,14 +547,16 @@ async function getStreamInfo(cacheKey: string, force = false, contentId = cacheK
 const CDM_PORT = Deno.env.get("VOYO_CDM_PORT") ?? "8091";
 const CDM_URL = Deno.env.get("VOYO_CDM_URL") ?? `http://127.0.0.1:${CDM_PORT}`;
 const KEY_TTL_MS = 30 * 60 * 1000;
-const WIDEVINE_SYSTEM_ID = "edef8ba9-79d6-4ace-a3c8-27dceb5404f0";
 
 type ContentKey = { kid: string; key: string };
 const keyCache = new Map<string, { keys: ContentKey[]; expiresAt: number }>();
 
 async function extractPssh(mpdUrl: string): Promise<string> {
   const res = await fetch(mpdUrl, {
-    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" },
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    },
   });
   if (!res.ok) throw new HttpError(res.status, `MPD fetch: ${res.status}`);
   const xml = await res.text();
@@ -463,13 +567,19 @@ async function extractPssh(mpdUrl: string): Promise<string> {
   );
   let m: RegExpExecArray | null;
   while ((m = cpRe.exec(xml)) !== null) {
-    const psshM = /<(?:[\w-]+:)?pssh[^>]*>\s*([A-Za-z0-9+/=]+)\s*<\/(?:[\w-]+:)?pssh>/i.exec(m[1]);
+    const psshM =
+      /<(?:[\w-]+:)?pssh[^>]*>\s*([A-Za-z0-9+/=]+)\s*<\/(?:[\w-]+:)?pssh>/i
+        .exec(m[1]);
     if (psshM) return psshM[1].trim();
   }
   throw new Error("no Widevine PSSH found in MPD");
 }
 
-async function getKeys(cacheKey: string, force = false, contentId = cacheKey): Promise<ContentKey[]> {
+async function getKeys(
+  cacheKey: string,
+  force = false,
+  contentId = cacheKey,
+): Promise<ContentKey[]> {
   if (!force) {
     const hit = keyCache.get(cacheKey);
     if (hit && hit.expiresAt > Date.now()) return hit.keys;
@@ -482,24 +592,38 @@ async function getKeys(cacheKey: string, force = false, contentId = cacheKey): P
     res = await fetch(`${CDM_URL}/keys`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pssh, licenseUrl: info.drm.url, headers: info.drm.headers }),
+      body: JSON.stringify({
+        pssh,
+        licenseUrl: info.drm.url,
+        headers: info.drm.headers,
+      }),
     });
   } catch (e) {
-    throw new Error(`CDM sidecar unreachable at ${CDM_URL} — is cdm.py running? (${(e as Error).message})`);
+    throw new Error(
+      `CDM sidecar unreachable at ${CDM_URL} — is cdm.py running? (${
+        (e as Error).message
+      })`,
+    );
   }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new HttpError(res.status, `CDM: ${body || res.status}`);
   }
   const keys = await res.json() as ContentKey[];
-  if (!Array.isArray(keys) || keys.length === 0) throw new Error("CDM returned no content keys");
+  if (!Array.isArray(keys) || keys.length === 0) {
+    throw new Error("CDM returned no content keys");
+  }
   keyCache.set(cacheKey, { keys, expiresAt: Date.now() + KEY_TTL_MS });
   return keys;
 }
 
 // === DRM pipeline: fetch MPD → download/decrypt fragments → feed named pipes → package with Shaka ===
-const MP4DECRYPT = resolveExecutable(Deno.env.get("VOYO_MP4DECRYPT") ?? "mp4decrypt");
-const SHAKA_PACKAGER = resolveExecutable(Deno.env.get("VOYO_SHAKA_PACKAGER") ?? "packager");
+const MP4DECRYPT = resolveExecutable(
+  Deno.env.get("VOYO_MP4DECRYPT") ?? "mp4decrypt",
+);
+const SHAKA_PACKAGER = resolveExecutable(
+  Deno.env.get("VOYO_SHAKA_PACKAGER") ?? "packager",
+);
 const LIVE_DIR = `${CONFIG_DIR}/live-shaka`;
 const PIPE_IDLE_MS = 60 * 1000;
 const PIPE_SYNC_FALLBACK_MS = 3_000;
@@ -513,7 +637,17 @@ const PIPE_NO_PROGRESS_MS = 60 * 1000;
 const PIPE_RETRY_DELAYS_MS = [3_000, 6_000, 12_000] as const;
 const PIPE_RETRY_CAP_MS = 20_000;
 const PIPE_RETRY_JITTER_RATIO = 0.2;
-const DRM_RESTART_COOLDOWN_MS = [10_000, 10_000, 20_000, 20_000, 30_000, 60_000, 60_000, 120_000, 180_000] as const;
+const DRM_RESTART_COOLDOWN_MS = [
+  10_000,
+  10_000,
+  20_000,
+  20_000,
+  30_000,
+  60_000,
+  60_000,
+  120_000,
+  180_000,
+] as const;
 const DRM_RESTART_COOLDOWN_CAP_MS = 180_000;
 
 type TrackKind = "audio" | "video";
@@ -616,7 +750,15 @@ type DrmChannelState = {
 
 const drmStates = new Map<string, DrmChannelState>();
 const drmStateStarts = new Map<string, Promise<DrmChannelState>>();
-const drmRestartCooldowns = new Map<string, { failures: number; retryAfterAt: number; lastReason: string; updatedAt: number }>();
+const drmRestartCooldowns = new Map<
+  string,
+  {
+    failures: number;
+    retryAfterAt: number;
+    lastReason: string;
+    updatedAt: number;
+  }
+>();
 let mp4decryptChecked = false;
 let shakaPackagerChecked = false;
 let cdmReachableChecked = false;
@@ -649,11 +791,19 @@ function restartCooldownMsForFailures(failures: number): number {
   return DRM_RESTART_COOLDOWN_MS[failures - 1] ?? DRM_RESTART_COOLDOWN_CAP_MS;
 }
 
-function recordRestartCooldown(channelId: string, reason: string): { failures: number; retryAfterAt: number } {
+function recordRestartCooldown(
+  channelId: string,
+  reason: string,
+): { failures: number; retryAfterAt: number } {
   const current = drmRestartCooldowns.get(channelId);
   const failures = (current?.failures ?? 0) + 1;
   const retryAfterAt = Date.now() + restartCooldownMsForFailures(failures);
-  drmRestartCooldowns.set(channelId, { failures, retryAfterAt, lastReason: reason, updatedAt: Date.now() });
+  drmRestartCooldowns.set(channelId, {
+    failures,
+    retryAfterAt,
+    lastReason: reason,
+    updatedAt: Date.now(),
+  });
   return { failures, retryAfterAt };
 }
 
@@ -661,7 +811,14 @@ function clearRestartCooldown(channelId: string): void {
   drmRestartCooldowns.delete(channelId);
 }
 
-function getRestartCooldown(channelId: string): { failures: number; retryAfterAt: number; lastReason: string; updatedAt: number } | null {
+function getRestartCooldown(
+  channelId: string,
+): {
+  failures: number;
+  retryAfterAt: number;
+  lastReason: string;
+  updatedAt: number;
+} | null {
   const entry = drmRestartCooldowns.get(channelId);
   if (!entry) return null;
   if (entry.retryAfterAt <= Date.now()) return entry;
@@ -680,11 +837,18 @@ function enforceRestartCooldown(channelId: string): void {
   );
 }
 
-function responseForError(error: unknown, fallbackStatus = 500, asJson = false): Response {
+function responseForError(
+  error: unknown,
+  fallbackStatus = 500,
+  asJson = false,
+): Response {
   if (error instanceof RestartCooldownError) {
     const headers = { "Retry-After": String(error.retryAfterSec) };
     return asJson
-      ? Response.json({ error: error.message, retryAfterSec: error.retryAfterSec }, { status: error.status, headers })
+      ? Response.json({
+        error: error.message,
+        retryAfterSec: error.retryAfterSec,
+      }, { status: error.status, headers })
       : new Response(error.message, { status: error.status, headers });
   }
   if (error instanceof HttpError) {
@@ -707,14 +871,18 @@ function playbackUnavailableResponse(): Response {
 
 function responseForPlaybackError(error: unknown): Response {
   if (error instanceof RestartCooldownError) return responseForError(error);
-  if (isTemporaryStreamRefreshError(error)) return playbackUnavailableResponse();
+  if (isTemporaryStreamRefreshError(error)) {
+    return playbackUnavailableResponse();
+  }
   return responseForError(error);
 }
 
 async function clearDir(dir: string): Promise<void> {
   try {
     for await (const entry of Deno.readDir(dir)) {
-      await Deno.remove(`${dir}/${entry.name}`, { recursive: true }).catch(() => {});
+      await Deno.remove(`${dir}/${entry.name}`, { recursive: true }).catch(
+        () => {},
+      );
     }
   } catch (e) {
     if (!(e instanceof Deno.errors.NotFound)) throw e;
@@ -731,7 +899,10 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function waitForNonEmptyFile(path: string, timeoutMs: number): Promise<void> {
+async function waitForNonEmptyFile(
+  path: string,
+  timeoutMs: number,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
@@ -757,7 +928,10 @@ function stateLogPath(state: DrmChannelState, name = "pipeline.log"): string {
   return `${state.dirs.logs}/${name}`;
 }
 
-async function logState(state: DrmChannelState, message: string): Promise<void> {
+async function logState(
+  state: DrmChannelState,
+  message: string,
+): Promise<void> {
   const line = `[${new Date().toISOString()}] ${message}`;
   console.log(`[shaka ${state.channelId}] ${message}`);
   await appendLog(stateLogPath(state), line).catch(() => {});
@@ -780,7 +954,7 @@ function decodeXmlText(text: string): string {
     .replaceAll("&amp;", "&")
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", "\"")
+    .replaceAll("&quot;", '"')
     .replaceAll("&apos;", "'");
 }
 
@@ -794,9 +968,15 @@ function parseXmlAttributes(src: string): Record<string, string> {
   return attrs;
 }
 
-function findXmlBlocks(xml: string, tag: string): Array<{ attrs: Record<string, string>; inner: string }> {
+function findXmlBlocks(
+  xml: string,
+  tag: string,
+): Array<{ attrs: Record<string, string>; inner: string }> {
   const blocks: Array<{ attrs: Record<string, string>; inner: string }> = [];
-  const re = new RegExp(`<${tag}\\b([^>]*?)(?:>([\\s\\S]*?)<\\/${tag}>|\\/>)`, "gi");
+  const re = new RegExp(
+    `<${tag}\\b([^>]*?)(?:>([\\s\\S]*?)<\\/${tag}>|\\/>)`,
+    "gi",
+  );
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml)) !== null) {
     blocks.push({ attrs: parseXmlAttributes(m[1]), inner: m[2] ?? "" });
@@ -805,19 +985,25 @@ function findXmlBlocks(xml: string, tag: string): Array<{ attrs: Record<string, 
 }
 
 function findXmlText(xml: string, tag: string): string | null {
-  const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i").exec(xml);
+  const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i").exec(
+    xml,
+  );
   return m ? decodeXmlText(m[1].trim()) : null;
 }
 
 function parseIsoDurationMs(input: string | undefined): number | null {
   if (!input) return null;
-  const m = /^P(?:([0-9.]+)D)?(?:T(?:([0-9.]+)H)?(?:([0-9.]+)M)?(?:([0-9.]+)S)?)?$/i.exec(input.trim());
+  const m =
+    /^P(?:([0-9.]+)D)?(?:T(?:([0-9.]+)H)?(?:([0-9.]+)M)?(?:([0-9.]+)S)?)?$/i
+      .exec(input.trim());
   if (!m) return null;
   const days = Number(m[1] ?? 0);
   const hours = Number(m[2] ?? 0);
   const mins = Number(m[3] ?? 0);
   const secs = Number(m[4] ?? 0);
-  return Math.round((((days * 24) + hours) * 60 + mins) * 60 * 1000 + secs * 1000);
+  return Math.round(
+    (((days * 24) + hours) * 60 + mins) * 60 * 1000 + secs * 1000,
+  );
 }
 
 function fillTemplate(
@@ -827,29 +1013,47 @@ function fillTemplate(
   number: number | null,
   time: number | null,
 ): string {
-  return template.replaceAll(/\$(RepresentationID|Bandwidth|Number|Time)(?:%0(\d+)d)?\$/g, (_m, token, widthRaw) => {
-    const width = Number(widthRaw ?? 0);
-    const pad = (value: string) => width > 0 ? value.padStart(width, "0") : value;
-    switch (token) {
-      case "RepresentationID":
-        return representationId;
-      case "Bandwidth":
-        return pad(String(bandwidth));
-      case "Number":
-        if (number == null) throw new Error(`template requires $Number$ but no segment number exists for ${representationId}`);
-        return pad(String(number));
-      case "Time":
-        if (time == null) throw new Error(`template requires $Time$ but no segment time exists for ${representationId}`);
-        return pad(String(time));
-      default:
-        return "";
-    }
-  });
+  return template.replaceAll(
+    /\$(RepresentationID|Bandwidth|Number|Time)(?:%0(\d+)d)?\$/g,
+    (_m, token, widthRaw) => {
+      const width = Number(widthRaw ?? 0);
+      const pad = (value: string) =>
+        width > 0 ? value.padStart(width, "0") : value;
+      switch (token) {
+        case "RepresentationID":
+          return representationId;
+        case "Bandwidth":
+          return pad(String(bandwidth));
+        case "Number":
+          if (number == null) {
+            throw new Error(
+              `template requires $Number$ but no segment number exists for ${representationId}`,
+            );
+          }
+          return pad(String(number));
+        case "Time":
+          if (time == null) {
+            throw new Error(
+              `template requires $Time$ but no segment time exists for ${representationId}`,
+            );
+          }
+          return pad(String(time));
+        default:
+          return "";
+      }
+    },
+  );
 }
 
-function parseSegmentTimeline(inner: string): Array<{ time: number | null; duration: number; repeat: number }> {
-  const timeline: Array<{ time: number | null; duration: number; repeat: number }> = [];
-  const tlMatch = /<SegmentTimeline\b[^>]*>([\s\S]*?)<\/SegmentTimeline>/i.exec(inner);
+function parseSegmentTimeline(
+  inner: string,
+): Array<{ time: number | null; duration: number; repeat: number }> {
+  const timeline: Array<
+    { time: number | null; duration: number; repeat: number }
+  > = [];
+  const tlMatch = /<SegmentTimeline\b[^>]*>([\s\S]*?)<\/SegmentTimeline>/i.exec(
+    inner,
+  );
   if (!tlMatch) return timeline;
   const re = /<S\b([^>]*)\/?>/gi;
   let m: RegExpExecArray | null;
@@ -866,16 +1070,19 @@ function parseSegmentTimeline(inner: string): Array<{ time: number | null; durat
   return timeline;
 }
 
-function parseSegmentTemplate(xml: string): { attrs: Record<string, string>; inner: string } | null {
-  const m = /<SegmentTemplate\b([^>]*)(?:\/>|>([\s\S]*?)<\/SegmentTemplate>)/i.exec(xml);
+function parseSegmentTemplate(
+  xml: string,
+): { attrs: Record<string, string>; inner: string } | null {
+  const m = /<SegmentTemplate\b([^>]*)(?:\/>|>([\s\S]*?)<\/SegmentTemplate>)/i
+    .exec(xml);
   if (!m) return null;
   return { attrs: parseXmlAttributes(m[1]), inner: m[2] ?? "" };
 }
 
 function parseSegmentList(
   xml: string,
-  representationId: string,
-  bandwidth: number,
+  _representationId: string,
+  _bandwidth: number,
   baseUrl: string,
   timescaleFallback: number,
 ): { timescale: number; initUrl: string; segments: ParsedSegment[] } | null {
@@ -886,7 +1093,8 @@ function parseSegmentList(
   const initAttrs = /<Initialization\b([^>]*)\/?>/i.exec(inner)?.[1];
   const initSource = initAttrs ? parseXmlAttributes(initAttrs).sourceURL : null;
   if (!initSource) return null;
-  const timescale = Number(attrs.timescale ?? timescaleFallback) || timescaleFallback || 1;
+  const timescale = Number(attrs.timescale ?? timescaleFallback) ||
+    timescaleFallback || 1;
   const urls: ParsedSegment[] = [];
   const timelineEntries = parseSegmentTimeline(inner);
   const segUrlRe = /<SegmentURL\b([^>]*)\/?>/gi;
@@ -929,17 +1137,34 @@ function buildSegmentsFromTemplate(
   const startNumber = Number(templateAttrs.startNumber ?? "1") || 1;
   const mediaUsesNumber = /\$Number(?:%0\d+d)?\$/.test(media);
   const mediaUsesTime = /\$Time(?:%0\d+d)?\$/.test(media);
-  const initUrl = new URL(fillTemplate(initialization, representationId, bandwidth, startNumber, null), baseUrl).toString();
+  const initUrl = new URL(
+    fillTemplate(
+      initialization,
+      representationId,
+      bandwidth,
+      startNumber,
+      null,
+    ),
+    baseUrl,
+  ).toString();
   const timeline = parseSegmentTimeline(templateInner);
   if (timeline.length === 0) {
     const duration = Number(templateAttrs.duration ?? "");
-    if (!mediaUsesNumber || !Number.isFinite(duration) || duration <= 0) return null;
+    if (!mediaUsesNumber || !Number.isFinite(duration) || duration <= 0) {
+      return null;
+    }
     const durationMs = duration / timescale * 1000;
     const segmentCount = timeShiftBufferDepthMs != null
-      ? Math.min(PIPE_SEGMENT_WINDOW, Math.max(1, Math.floor(timeShiftBufferDepthMs / durationMs)))
+      ? Math.min(
+        PIPE_SEGMENT_WINDOW,
+        Math.max(1, Math.floor(timeShiftBufferDepthMs / durationMs)),
+      )
       : PIPE_SEGMENT_WINDOW;
-    const liveOffset = periodElapsedMs != null ? Math.max(0, Math.floor(periodElapsedMs / durationMs)) : segmentCount - 1;
-    const firstNumber = startNumber + Math.max(0, liveOffset - segmentCount + 1);
+    const liveOffset = periodElapsedMs != null
+      ? Math.max(0, Math.floor(periodElapsedMs / durationMs))
+      : segmentCount - 1;
+    const firstNumber = startNumber +
+      Math.max(0, liveOffset - segmentCount + 1);
     return {
       timescale,
       initUrl,
@@ -947,7 +1172,10 @@ function buildSegmentsFromTemplate(
         const number = firstNumber + index;
         return {
           id: `n-${number}`,
-          url: new URL(fillTemplate(media, representationId, bandwidth, number, null), baseUrl).toString(),
+          url: new URL(
+            fillTemplate(media, representationId, bandwidth, number, null),
+            baseUrl,
+          ).toString(),
           number,
           time: null,
           duration,
@@ -967,7 +1195,10 @@ function buildSegmentsFromTemplate(
       const id = mediaUsesTime ? `t-${time}` : `n-${segmentNumber}`;
       segments.push({
         id,
-        url: new URL(fillTemplate(media, representationId, bandwidth, number, time), baseUrl).toString(),
+        url: new URL(
+          fillTemplate(media, representationId, bandwidth, number, time),
+          baseUrl,
+        ).toString(),
         number,
         time,
         duration: entry.duration,
@@ -991,7 +1222,8 @@ function resolveRepresentation(
   const adaptAttrs = adaptation.attrs;
   const representationId = repAttrs.id;
   if (!representationId) return null;
-  const bandwidth = Number(repAttrs.bandwidth ?? adaptAttrs.bandwidth ?? "0") || 0;
+  const bandwidth = Number(repAttrs.bandwidth ?? adaptAttrs.bandwidth ?? "0") ||
+    0;
   const mimeType = repAttrs.mimeType ?? adaptAttrs.mimeType ?? `${kind}/mp4`;
   const codecs = repAttrs.codecs ?? adaptAttrs.codecs ?? "";
   const language = adaptAttrs.lang;
@@ -1000,7 +1232,10 @@ function resolveRepresentation(
 
   const repTemplate = parseSegmentTemplate(representation.inner);
   const adaptTemplate = parseSegmentTemplate(adaptation.inner);
-  const mergedTemplateAttrs = { ...(adaptTemplate?.attrs ?? {}), ...(repTemplate?.attrs ?? {}) };
+  const mergedTemplateAttrs = {
+    ...(adaptTemplate?.attrs ?? {}),
+    ...(repTemplate?.attrs ?? {}),
+  };
   const templateInner = repTemplate?.inner || adaptTemplate?.inner || "";
   const fromTemplate = Object.keys(mergedTemplateAttrs).length > 0
     ? buildSegmentsFromTemplate(
@@ -1046,31 +1281,48 @@ function resolveRepresentation(
 function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
   const mpdOpen = /<MPD\b([^>]*)>/i.exec(xml);
   const mpdAttrs = mpdOpen ? parseXmlAttributes(mpdOpen[1]) : {};
-  const timeShiftBufferDepthMs = parseIsoDurationMs(mpdAttrs.timeShiftBufferDepth);
+  const timeShiftBufferDepthMs = parseIsoDurationMs(
+    mpdAttrs.timeShiftBufferDepth,
+  );
   const mpdBase = findXmlText(xml, "BaseURL");
   const baseUrl = mpdBase ? new URL(mpdBase, mpdUrl).toString() : mpdUrl;
   const period = findXmlBlocks(xml, "Period")[0];
   if (!period) throw new Error("MPD has no Period");
-  const availabilityStartTimeMs = Date.parse(mpdAttrs.availabilityStartTime ?? "");
+  const availabilityStartTimeMs = Date.parse(
+    mpdAttrs.availabilityStartTime ?? "",
+  );
   const publishTimeMs = Date.parse(mpdAttrs.publishTime ?? "");
   const periodStartMs = parseIsoDurationMs(period.attrs.start) ?? 0;
-  const periodElapsedMs = Number.isFinite(availabilityStartTimeMs) && Number.isFinite(publishTimeMs)
-    ? Math.max(0, publishTimeMs - availabilityStartTimeMs - periodStartMs)
-    : null;
+  const periodElapsedMs =
+    Number.isFinite(availabilityStartTimeMs) && Number.isFinite(publishTimeMs)
+      ? Math.max(0, publishTimeMs - availabilityStartTimeMs - periodStartMs)
+      : null;
   const periodBase = findXmlText(period.inner, "BaseURL");
-  const resolvedPeriodBase = periodBase ? new URL(periodBase, baseUrl).toString() : baseUrl;
+  const resolvedPeriodBase = periodBase
+    ? new URL(periodBase, baseUrl).toString()
+    : baseUrl;
 
   const audio: ParsedRepresentation[] = [];
   const video: ParsedRepresentation[] = [];
   for (const adaptation of findXmlBlocks(period.inner, "AdaptationSet")) {
     const mimeType = adaptation.attrs.mimeType ?? "";
     const contentType = adaptation.attrs.contentType ??
-      (mimeType.startsWith("audio/") ? "audio" : mimeType.startsWith("video/") ? "video" : "");
-    const kind = contentType === "audio" || contentType === "video" ? contentType : null;
+      (mimeType.startsWith("audio/")
+        ? "audio"
+        : mimeType.startsWith("video/")
+        ? "video"
+        : "");
+    const kind = contentType === "audio" || contentType === "video"
+      ? contentType
+      : null;
     if (!kind) continue;
     const adaptationBase = findXmlText(adaptation.inner, "BaseURL");
-    const resolvedAdaptationBase = adaptationBase ? new URL(adaptationBase, resolvedPeriodBase).toString() : resolvedPeriodBase;
-    for (const representation of findXmlBlocks(adaptation.inner, "Representation")) {
+    const resolvedAdaptationBase = adaptationBase
+      ? new URL(adaptationBase, resolvedPeriodBase).toString()
+      : resolvedPeriodBase;
+    for (
+      const representation of findXmlBlocks(adaptation.inner, "Representation")
+    ) {
       const parsed = resolveRepresentation(
         kind,
         representation,
@@ -1085,20 +1337,26 @@ function parseMpdXml(xml: string, mpdUrl: string): ParsedMpd {
   }
 
   return {
-    minimumUpdatePeriodMs: parseIsoDurationMs(mpdAttrs.minimumUpdatePeriod) ?? PIPE_SYNC_FALLBACK_MS,
+    minimumUpdatePeriodMs: parseIsoDurationMs(mpdAttrs.minimumUpdatePeriod) ??
+      PIPE_SYNC_FALLBACK_MS,
     audio,
     video,
   };
 }
 
-async function fetchMpdSnapshot(mpdUrl: string): Promise<{ xml: string; parsed: ParsedMpd }> {
+async function fetchMpdSnapshot(
+  mpdUrl: string,
+): Promise<{ xml: string; parsed: ParsedMpd }> {
   const res = await fetch(mpdUrl, { headers: proxyFetchHeaders() });
   if (!res.ok) throw new HttpError(res.status, `MPD fetch: ${res.status}`);
   const xml = await res.text();
   return { xml, parsed: parseMpdXml(xml, mpdUrl) };
 }
 
-function chooseRepresentation(list: ParsedRepresentation[], preferredId?: string): ParsedRepresentation | null {
+function chooseRepresentation(
+  list: ParsedRepresentation[],
+  preferredId?: string,
+): ParsedRepresentation | null {
   if (preferredId) {
     const keep = list.find((item) => item.representationId === preferredId);
     if (keep) return keep;
@@ -1107,11 +1365,17 @@ function chooseRepresentation(list: ParsedRepresentation[], preferredId?: string
 }
 
 function segmentFileStem(kind: TrackKind, segment: ParsedSegment): string {
-  if (segment.number != null) return `${kind}-n${String(segment.number).padStart(8, "0")}`;
+  if (segment.number != null) {
+    return `${kind}-n${String(segment.number).padStart(8, "0")}`;
+  }
   return `${kind}-t${String(segment.time ?? 0).padStart(12, "0")}`;
 }
 
-function createTrackRuntime(kind: TrackKind, source: ParsedRepresentation, dirs: ChannelDirs): TrackRuntime {
+function createTrackRuntime(
+  kind: TrackKind,
+  source: ParsedRepresentation,
+  dirs: ChannelDirs,
+): TrackRuntime {
   return {
     kind,
     source,
@@ -1132,7 +1396,9 @@ function mergeTrackRuntime(
 ): TrackRuntime {
   if (!current) return createTrackRuntime(kind, next, dirs);
   if (current.source.representationId !== next.representationId) {
-    throw new Error(`${kind} representation changed from ${current.source.representationId} to ${next.representationId}; rebuild required`);
+    throw new Error(
+      `${kind} representation changed from ${current.source.representationId} to ${next.representationId}; rebuild required`,
+    );
   }
   current.source = next;
   return current;
@@ -1140,14 +1406,19 @@ function mergeTrackRuntime(
 
 async function downloadToFile(url: string, path: string): Promise<void> {
   const res = await fetch(url, { headers: proxyFetchHeaders() });
-  if (!res.ok) throw new HttpError(res.status, `download ${res.status}: ${url}`);
+  if (!res.ok) {
+    throw new HttpError(res.status, `download ${res.status}: ${url}`);
+  }
   const bytes = new Uint8Array(await res.arrayBuffer());
   const tmp = `${path}.tmp`;
   await Deno.writeFile(tmp, bytes);
   await Deno.rename(tmp, path);
 }
 
-async function ensureCommandAvailable(command: string, label: string): Promise<void> {
+async function ensureCommandAvailable(
+  command: string,
+  label: string,
+): Promise<void> {
   try {
     await new Deno.Command(command, {
       args: [],
@@ -1157,7 +1428,11 @@ async function ensureCommandAvailable(command: string, label: string): Promise<v
     }).output();
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) {
-      throw new Error(`${label} not found: configure ${label === "mp4decrypt" ? "VOYO_MP4DECRYPT" : "VOYO_SHAKA_PACKAGER"} or install ${label}`);
+      throw new Error(
+        `${label} not found: configure ${
+          label === "mp4decrypt" ? "VOYO_MP4DECRYPT" : "VOYO_SHAKA_PACKAGER"
+        } or install ${label}`,
+      );
     }
     throw e;
   }
@@ -1181,7 +1456,9 @@ async function ensureCdmHealthy(): Promise<void> {
   try {
     res = await fetch(`${CDM_URL}/health`);
   } catch (e) {
-    throw new Error(`CDM sidecar unreachable at ${CDM_URL}: ${(e as Error).message}`);
+    throw new Error(
+      `CDM sidecar unreachable at ${CDM_URL}: ${(e as Error).message}`,
+    );
   }
   if (!res.ok) throw new Error(`CDM sidecar health failed: HTTP ${res.status}`);
   cdmReachableChecked = true;
@@ -1204,15 +1481,24 @@ async function decryptFile(
   }).output();
   if (!out.success) {
     const stderr = new TextDecoder().decode(out.stderr).trim();
-    throw new Error(`mp4decrypt failed for ${inputPath}: ${stderr || `exit ${out.code}`}`);
+    throw new Error(
+      `mp4decrypt failed for ${inputPath}: ${stderr || `exit ${out.code}`}`,
+    );
   }
   await Deno.rename(`${outputPath}.tmp`, outputPath);
 }
 
-async function ensureTrackInitPrepared(state: DrmChannelState, track: TrackRuntime): Promise<void> {
+async function ensureTrackInitPrepared(
+  state: DrmChannelState,
+  track: TrackRuntime,
+): Promise<void> {
   if (track.initPrepared) return;
   await downloadToFile(track.source.initUrl, track.initEncryptedPath);
-  await decryptFile(track.initEncryptedPath, track.initDecryptedPath, state.keys);
+  await decryptFile(
+    track.initEncryptedPath,
+    track.initDecryptedPath,
+    state.keys,
+  );
   track.initPrepared = true;
   await logState(state, `${track.kind}: prepared init segment`);
 }
@@ -1224,13 +1510,24 @@ function isExpiredStreamError(error: unknown): boolean {
     (error.status === 401 || error.status === 403 || error.status === 404);
 }
 
-async function refreshDrmState(state: DrmChannelState, force = false): Promise<void> {
+async function refreshDrmState(
+  state: DrmChannelState,
+  force = false,
+): Promise<void> {
   const info = await getStreamInfo(state.channelId, force, state.contentId);
   if (!info.drm) throw new Error("channel is not DRM — use /live/<id>.m3u8");
   const snapshot = await fetchMpdSnapshot(info.url);
-  const video = chooseRepresentation(snapshot.parsed.video, state.video?.source.representationId);
-  const audio = chooseRepresentation(snapshot.parsed.audio, state.audio?.source.representationId);
-  if (!video || !audio) throw new Error("MPD did not expose both audio and video representations");
+  const video = chooseRepresentation(
+    snapshot.parsed.video,
+    state.video?.source.representationId,
+  );
+  const audio = chooseRepresentation(
+    snapshot.parsed.audio,
+    state.audio?.source.representationId,
+  );
+  if (!video || !audio) {
+    throw new Error("MPD did not expose both audio and video representations");
+  }
   state.streamInfo = info;
   state.manifest = snapshot.parsed;
   state.manifestXml = snapshot.xml;
@@ -1240,10 +1537,17 @@ async function refreshDrmState(state: DrmChannelState, force = false): Promise<v
   state.lastRefreshAt = Date.now();
 }
 
-async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): Promise<boolean> {
+async function syncTrackSegments(
+  state: DrmChannelState,
+  track: TrackRuntime,
+): Promise<boolean> {
   await ensureTrackInitPrepared(state, track);
   const desired = track.source.segments.slice(-PIPE_SEGMENT_WINDOW);
-  const keepIds = new Set(track.source.segments.slice(-PIPE_SEGMENT_RETENTION).map((segment) => segment.id));
+  const keepIds = new Set(
+    track.source.segments.slice(-PIPE_SEGMENT_RETENTION).map((segment) =>
+      segment.id
+    ),
+  );
   const knownIds = new Set(track.segments.map((segment) => segment.id));
   let madeProgress = false;
 
@@ -1253,7 +1557,12 @@ async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): P
     const encryptedPath = `${state.dirs.enc}/${stem}.m4s.enc`;
     const decryptedPath = `${state.dirs.dec}/${stem}.m4s`;
     await downloadToFile(segment.url, encryptedPath);
-    await decryptFile(encryptedPath, decryptedPath, state.keys, track.initEncryptedPath);
+    await decryptFile(
+      encryptedPath,
+      decryptedPath,
+      state.keys,
+      track.initEncryptedPath,
+    );
     track.segments.push({
       ...segment,
       encryptedPath,
@@ -1266,7 +1575,9 @@ async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): P
     madeProgress = true;
   }
 
-  const order = new Map(track.source.segments.map((segment, index) => [segment.id, index]));
+  const order = new Map(
+    track.source.segments.map((segment, index) => [segment.id, index]),
+  );
   const survivors: LocalSegment[] = [];
   for (const segment of track.segments) {
     if (keepIds.has(segment.id) || segment.writtenAt === null) {
@@ -1281,12 +1592,19 @@ async function syncTrackSegments(state: DrmChannelState, track: TrackRuntime): P
   return madeProgress;
 }
 
-async function writeFileToWriter(path: string, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
+async function writeFileToWriter(
+  path: string,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+): Promise<void> {
   const bytes = await Deno.readFile(path);
   await writer.write(bytes);
 }
 
-async function feedTrack(state: DrmChannelState, track: TrackRuntime, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
+async function feedTrack(
+  state: DrmChannelState,
+  track: TrackRuntime,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+): Promise<void> {
   if (!track.initPrepared) throw new Error(`${track.kind} init not prepared`);
   if (!track.initWritten) {
     await writeFileToWriter(track.initDecryptedPath, writer);
@@ -1294,7 +1612,9 @@ async function feedTrack(state: DrmChannelState, track: TrackRuntime, writer: Wr
     await logState(state, `${track.kind}: wrote init to pipe`);
   }
 
-  const order = new Map(track.source.segments.map((segment, index) => [segment.id, index]));
+  const order = new Map(
+    track.source.segments.map((segment, index) => [segment.id, index]),
+  );
   const pending = track.segments
     .filter((segment) => !track.sentSegmentIds.has(segment.id))
     .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
@@ -1315,11 +1635,16 @@ async function createNamedPipe(path: string): Promise<void> {
   }).output();
   if (!out.success) {
     const stderr = new TextDecoder().decode(out.stderr).trim();
-    throw new Error(`mkfifo failed for ${path}: ${stderr || `exit ${out.code}`}`);
+    throw new Error(
+      `mkfifo failed for ${path}: ${stderr || `exit ${out.code}`}`,
+    );
   }
 }
 
-async function pipeStreamToLog(stream: ReadableStream<Uint8Array> | null, path: string): Promise<void> {
+async function pipeStreamToLog(
+  stream: ReadableStream<Uint8Array> | null,
+  path: string,
+): Promise<void> {
   if (!stream) return;
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -1327,21 +1652,38 @@ async function pipeStreamToLog(stream: ReadableStream<Uint8Array> | null, path: 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value) await Deno.writeTextFile(path, decoder.decode(value, { stream: true }), { create: true, append: true });
+      if (value) {
+        await Deno.writeTextFile(
+          path,
+          decoder.decode(value, { stream: true }),
+          { create: true, append: true },
+        );
+      }
     }
     const tail = decoder.decode();
-    if (tail) await Deno.writeTextFile(path, tail, { create: true, append: true });
+    if (tail) {
+      await Deno.writeTextFile(path, tail, { create: true, append: true });
+    }
   } finally {
     reader.releaseLock();
   }
 }
 
 function buildPackagerArgs(state: DrmChannelState): string[] {
-  if (!state.audio || !state.video) throw new Error("packager started before tracks were resolved");
-  const audioName = (state.audio.source.language ?? "audio").replaceAll(",", "_");
+  if (!state.audio || !state.video) {
+    throw new Error("packager started before tracks were resolved");
+  }
+  const audioName = (state.audio.source.language ?? "audio").replaceAll(
+    ",",
+    "_",
+  );
   return [
-    `in=${state.pipePaths.audio},stream=audio,init_segment=audio/init.mp4,segment_template=audio/$Number$.m4s,playlist_name=audio.m3u8,hls_group_id=audio,hls_name=${audioName},bw=${Math.max(1, state.audio.source.bandwidth)}`,
-    `in=${state.pipePaths.video},stream=video,init_segment=video/init.mp4,segment_template=video/$Number$.m4s,playlist_name=video.m3u8,bw=${Math.max(1, state.video.source.bandwidth)}`,
+    `in=${state.pipePaths.audio},stream=audio,init_segment=audio/init.mp4,segment_template=audio/$Number$.m4s,playlist_name=audio.m3u8,hls_group_id=audio,hls_name=${audioName},bw=${
+      Math.max(1, state.audio.source.bandwidth)
+    }`,
+    `in=${state.pipePaths.video},stream=video,init_segment=video/init.mp4,segment_template=video/$Number$.m4s,playlist_name=video.m3u8,bw=${
+      Math.max(1, state.video.source.bandwidth)
+    }`,
     "--hls_master_playlist_output",
     "index.m3u8",
     "--hls_playlist_type",
@@ -1394,16 +1736,24 @@ async function startPackager(state: DrmChannelState): Promise<void> {
   });
 }
 
-function outputPathFor(state: DrmChannelState, relativePath: string): string | null {
+function outputPathFor(
+  state: DrmChannelState,
+  relativePath: string,
+): string | null {
   const clean = relativePath.split("/").filter(Boolean);
   if (clean.length === 0) return null;
   if (clean.some((part) => part === "." || part === "..")) return null;
   return `${state.dirs.out}/${clean.join("/")}`;
 }
 
-async function runSyncCycle(state: DrmChannelState, forceRefresh: boolean): Promise<boolean> {
+async function runSyncCycle(
+  state: DrmChannelState,
+  forceRefresh: boolean,
+): Promise<boolean> {
   await refreshDrmState(state, forceRefresh);
-  if (!state.audio || !state.video || !state.audioWriter || !state.videoWriter) {
+  if (
+    !state.audio || !state.video || !state.audioWriter || !state.videoWriter
+  ) {
     throw new Error("DRM state is not fully initialized");
   }
   const audioProgress = await syncTrackSegments(state, state.audio);
@@ -1419,12 +1769,19 @@ async function syncDrmStateOnce(state: DrmChannelState): Promise<boolean> {
   } catch (error) {
     if (!isExpiredStreamError(error)) throw error;
     const status = (error as HttpError).status;
-    await logState(state, `upstream ${status}; force-refreshing stream info and retrying sync once`);
+    await logState(
+      state,
+      `upstream ${status}; force-refreshing stream info and retrying sync once`,
+    );
     return await runSyncCycle(state, true);
   }
 }
 
-async function disposeState(state: DrmChannelState, reason: string, cleanupDir = true): Promise<void> {
+async function disposeState(
+  state: DrmChannelState,
+  reason: string,
+  cleanupDir = true,
+): Promise<void> {
   if (state.closed) return;
   state.closed = true;
   state.stopRequested = true;
@@ -1435,30 +1792,39 @@ async function disposeState(state: DrmChannelState, reason: string, cleanupDir =
 
   try {
     await state.audioWriter?.close();
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
   try {
     await state.videoWriter?.close();
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
   try {
     state.audioPipeFile?.close();
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
   try {
     state.videoPipeFile?.close();
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
 
   try {
     state.packager?.process.kill("SIGTERM");
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
   try {
     await state.packager?.status;
-  } catch {}
+  } catch { /* Best-effort cleanup. */ }
 
-  if (cleanupDir) await Deno.remove(state.workDir, { recursive: true }).catch(() => {});
+  if (cleanupDir) {
+    await Deno.remove(state.workDir, { recursive: true }).catch(() => {});
+  }
 }
 
-async function disposeAllDrmStates(reason: string, cleanupDir = true): Promise<void> {
+async function disposeAllDrmStates(
+  reason: string,
+  cleanupDir = true,
+): Promise<void> {
   const states = [...drmStates.values()];
-  await Promise.all(states.map((state) => disposeState(state, reason, cleanupDir).catch(() => {})));
+  await Promise.all(
+    states.map((state) =>
+      disposeState(state, reason, cleanupDir).catch(() => {})
+    ),
+  );
 }
 
 async function runDrmLoop(state: DrmChannelState): Promise<void> {
@@ -1475,9 +1841,17 @@ async function runDrmLoop(state: DrmChannelState): Promise<void> {
       if (playlistPath && !state.readySettled && await exists(playlistPath)) {
         resolveStateReady(state, playlistPath);
       }
-      if (!madeProgress && Date.now() - state.lastProgressAt > PIPE_NO_PROGRESS_MS) {
-        recordRestartCooldown(state.channelId, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
-        await disposeState(state, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+      if (
+        !madeProgress && Date.now() - state.lastProgressAt > PIPE_NO_PROGRESS_MS
+      ) {
+        recordRestartCooldown(
+          state.channelId,
+          `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`,
+        );
+        await disposeState(
+          state,
+          `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`,
+        );
         return;
       }
     } catch (e) {
@@ -1489,19 +1863,34 @@ async function runDrmLoop(state: DrmChannelState): Promise<void> {
         await disposeState(state, state.lastError);
         return;
       }
-      if (/rebuild required|packager exited|Broken pipe|closed/i.test(state.lastError)) {
+      if (
+        /rebuild required|packager exited|Broken pipe|closed/i.test(
+          state.lastError,
+        )
+      ) {
         recordRestartCooldown(state.channelId, state.lastError);
         await disposeState(state, state.lastError);
         return;
       }
       if (Date.now() - state.lastProgressAt > PIPE_NO_PROGRESS_MS) {
-        recordRestartCooldown(state.channelId, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
-        await disposeState(state, `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`);
+        recordRestartCooldown(
+          state.channelId,
+          `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`,
+        );
+        await disposeState(
+          state,
+          `no upstream progress for ${Math.round(PIPE_NO_PROGRESS_MS / 1000)}s`,
+        );
         return;
       }
       state.consecutiveFailures += 1;
-      state.nextRetryDelayMs = retryDelayMsForFailures(state.consecutiveFailures);
-      await logState(state, `retrying in ${state.nextRetryDelayMs}ms after failure ${state.consecutiveFailures}`);
+      state.nextRetryDelayMs = retryDelayMsForFailures(
+        state.consecutiveFailures,
+      );
+      await logState(
+        state,
+        `retrying in ${state.nextRetryDelayMs}ms after failure ${state.consecutiveFailures}`,
+      );
       await sleep(state.nextRetryDelayMs);
       continue;
     }
@@ -1509,12 +1898,18 @@ async function runDrmLoop(state: DrmChannelState): Promise<void> {
   }
 }
 
-async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string): Promise<DrmChannelState> {
+async function startDrmState(
+  channel: Pick<Channel, "id" | "contentId"> | string,
+): Promise<DrmChannelState> {
   await ensureMp4decrypt();
   await ensureShakaPackager();
   await ensureCdmHealthy();
-  const entry = typeof channel === "string" ? resolveRequestedChannel(channel) : channel;
-  const channelId = typeof channel === "string" ? entry?.id ?? channel : channel.id;
+  const entry = typeof channel === "string"
+    ? resolveRequestedChannel(channel)
+    : channel;
+  const channelId = typeof channel === "string"
+    ? entry?.id ?? channel
+    : channel.id;
   const resolvedContentId = contentIdFor(entry ?? channelId);
 
   const workDir = `${LIVE_DIR}/${channelId}`;
@@ -1527,7 +1922,13 @@ async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string
   };
   await ensureDir(workDir);
   await clearDir(workDir);
-  await Promise.all([ensureDir(dirs.enc), ensureDir(dirs.dec), ensureDir(dirs.pipes), ensureDir(dirs.out), ensureDir(dirs.logs)]);
+  await Promise.all([
+    ensureDir(dirs.enc),
+    ensureDir(dirs.dec),
+    ensureDir(dirs.pipes),
+    ensureDir(dirs.out),
+    ensureDir(dirs.logs),
+  ]);
   let keys: ContentKey[];
   try {
     keys = await getKeys(channelId, false, resolvedContentId);
@@ -1543,7 +1944,10 @@ async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string
     contentId: resolvedContentId,
     workDir,
     dirs,
-    pipePaths: { audio: `${dirs.pipes}/audio.pipe`, video: `${dirs.pipes}/video.pipe` },
+    pipePaths: {
+      audio: `${dirs.pipes}/audio.pipe`,
+      video: `${dirs.pipes}/video.pipe`,
+    },
     ready: ready.promise,
     readyResolve: ready.resolve,
     readyReject: ready.reject,
@@ -1584,7 +1988,10 @@ async function startDrmState(channel: Pick<Channel, "id" | "contentId"> | string
     state.lastError = null;
     state.nextRetryDelayMs = state.syncIntervalMs;
     clearRestartCooldown(channelId);
-    await waitForNonEmptyFile(`${state.dirs.out}/index.m3u8`, PLAYLIST_WAIT_TIMEOUT_MS);
+    await waitForNonEmptyFile(
+      `${state.dirs.out}/index.m3u8`,
+      PLAYLIST_WAIT_TIMEOUT_MS,
+    );
     resolveStateReady(state, `${state.dirs.out}/index.m3u8`);
     state.loop = runDrmLoop(state);
     return state;
@@ -1626,7 +2033,11 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, state] of drmStates) {
     if (now - state.lastAccess > PIPE_IDLE_MS) {
-      void disposeState(state, `idle ${Math.round((now - state.lastAccess) / 1000)}s`, true).catch(() => {
+      void disposeState(
+        state,
+        `idle ${Math.round((now - state.lastAccess) / 1000)}s`,
+        true,
+      ).catch(() => {
         drmStates.delete(id);
       });
     }
@@ -1638,8 +2049,9 @@ async function collectFiles(root: string, prefix = ""): Promise<string[]> {
   try {
     for await (const entry of Deno.readDir(root)) {
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory) out.push(...await collectFiles(`${root}/${entry.name}`, rel));
-      else out.push(rel);
+      if (entry.isDirectory) {
+        out.push(...await collectFiles(`${root}/${entry.name}`, rel));
+      } else out.push(rel);
     }
   } catch (e) {
     if (!(e instanceof Deno.errors.NotFound)) throw e;
@@ -1657,7 +2069,10 @@ function mimeTypeFor(path: string): string {
   return "application/octet-stream";
 }
 
-async function serveDrmOutputFile(channelId: string, relativePath: string): Promise<Response> {
+async function serveDrmOutputFile(
+  channelId: string,
+  relativePath: string,
+): Promise<Response> {
   const state = drmStates.get(channelId);
   if (state) state.lastAccess = Date.now();
   const baseState = state ?? {
@@ -1668,10 +2083,15 @@ async function serveDrmOutputFile(channelId: string, relativePath: string): Prom
   try {
     const file = await Deno.open(path, { read: true });
     return new Response(file.readable, {
-      headers: { "Content-Type": mimeTypeFor(relativePath), "Cache-Control": "no-store" },
+      headers: {
+        "Content-Type": mimeTypeFor(relativePath),
+        "Cache-Control": "no-store",
+      },
     });
   } catch (e) {
-    if (e instanceof Deno.errors.NotFound) return new Response("not found", { status: 404 });
+    if (e instanceof Deno.errors.NotFound) {
+      return new Response("not found", { status: 404 });
+    }
     throw e;
   }
 }
@@ -1689,10 +2109,16 @@ const emptyConfig: Config = {
 };
 
 function normalizeConfig(data: Partial<Config>): Config {
-  const normalizeChannel = (entry: Partial<Channel>, fallbackKind?: "channel" | "event"): Channel => {
+  const normalizeChannel = (
+    entry: Partial<Channel>,
+    fallbackKind?: "channel" | "event",
+  ): Channel => {
     const kind = entry.kind ?? fallbackKind;
-    const contentId = entry.contentId ?? (kind === "event" && entry.id ? inferEventContentId(entry.id) : null);
-    const id = kind === "event" && contentId ? publicContentRouteId(contentId) : (entry.id ?? "");
+    const contentId = entry.contentId ??
+      (kind === "event" && entry.id ? inferEventContentId(entry.id) : null);
+    const id = kind === "event" && contentId
+      ? publicContentRouteId(contentId)
+      : (entry.id ?? "");
     return {
       id,
       contentId,
@@ -1718,16 +2144,25 @@ function normalizeConfig(data: Partial<Config>): Config {
       uuid: data.session?.uuid ?? emptyConfig.session.uuid,
       issuedAt: data.session?.issuedAt ?? emptyConfig.session.issuedAt,
     },
-    channels: Array.isArray(data.channels) ? data.channels.map((entry) => normalizeChannel(entry, "channel")) : [],
-    manualEvents: Array.isArray(data.manualEvents) ? data.manualEvents.map((entry) => normalizeChannel(entry, "event")) : [],
+    channels: Array.isArray(data.channels)
+      ? data.channels.map((entry) => normalizeChannel(entry, "channel"))
+      : [],
+    manualEvents: Array.isArray(data.manualEvents)
+      ? data.manualEvents.map((entry) => normalizeChannel(entry, "event"))
+      : [],
     channelsUpdatedAt: data.channelsUpdatedAt ?? null,
   };
 }
 
-function migrateFromV1(data: { auth?: { username?: string; password?: string } }): Config {
+function migrateFromV1(
+  data: { auth?: { username?: string; password?: string } },
+): Config {
   return {
     ...emptyConfig,
-    credentials: { username: data.auth?.username ?? "", password: data.auth?.password ?? "" },
+    credentials: {
+      username: data.auth?.username ?? "",
+      password: data.auth?.password ?? "",
+    },
   };
 }
 
@@ -1768,10 +2203,17 @@ function saveConfig(): Promise<void> {
 }
 
 // === Auth refresh (lazy + on 401 retry) ===
-async function ensureAuth(force = false): Promise<{ token: string; uuid: string }> {
-  const issued = config.session.issuedAt ? new Date(config.session.issuedAt).getTime() : 0;
-  const fresh = !force && config.session.token && config.session.uuid && Date.now() - issued < AUTH_REFRESH_MS;
-  if (fresh) return { token: config.session.token!, uuid: config.session.uuid! };
+async function ensureAuth(
+  force = false,
+): Promise<{ token: string; uuid: string }> {
+  const issued = config.session.issuedAt
+    ? new Date(config.session.issuedAt).getTime()
+    : 0;
+  const fresh = !force && config.session.token && config.session.uuid &&
+    Date.now() - issued < AUTH_REFRESH_MS;
+  if (fresh) {
+    return { token: config.session.token!, uuid: config.session.uuid! };
+  }
   if (!config.credentials.username || !config.credentials.password) {
     throw new Error("missing credentials in config.json");
   }
@@ -1782,7 +2224,9 @@ async function ensureAuth(force = false): Promise<{ token: string; uuid: string 
   return { token, uuid };
 }
 
-async function withAuth<T>(fn: (token: string, uuid: string) => Promise<T>): Promise<T> {
+async function withAuth<T>(
+  fn: (token: string, uuid: string) => Promise<T>,
+): Promise<T> {
   let { token, uuid } = await ensureAuth();
   try {
     return await fn(token, uuid);
@@ -1798,7 +2242,8 @@ async function withAuth<T>(fn: (token: string, uuid: string) => Promise<T>): Pro
 
 async function getChannels(force = false): Promise<Channel[]> {
   const stale = !config.channelsUpdatedAt ||
-    Date.now() - new Date(config.channelsUpdatedAt).getTime() > CHANNELS_REFRESH_MS;
+    Date.now() - new Date(config.channelsUpdatedAt).getTime() >
+      CHANNELS_REFRESH_MS;
   if (force || stale || config.channels.length === 0) {
     const list = await withAuth((t, u) => listChannels(t, u));
     config.channels = list;
@@ -1820,11 +2265,16 @@ async function refreshManualEvents(force = false): Promise<void> {
       entry.contentId = resolvedContentId;
       mutated = true;
     }
-    const checkedAt = entry.lastCheckedAt ? new Date(entry.lastCheckedAt).getTime() : 0;
+    const checkedAt = entry.lastCheckedAt
+      ? new Date(entry.lastCheckedAt).getTime()
+      : 0;
     const stale = !checkedAt || (Date.now() - checkedAt > 5 * 60 * 1000);
     if (!force && !stale) continue;
     const probed = await probeStreamKind(entry.id, resolvedContentId);
-    if (entry.streamKind !== probed.streamKind || entry.lastError !== probed.lastError || force) {
+    if (
+      entry.streamKind !== probed.streamKind ||
+      entry.lastError !== probed.lastError || force
+    ) {
       entry.streamKind = probed.streamKind;
       entry.lastError = probed.lastError;
       entry.lastCheckedAt = new Date().toISOString();
@@ -1848,7 +2298,8 @@ async function addManualEvent(value: string): Promise<Channel> {
     contentRouteAliases(entry).includes(parsed.id)
   );
   const base = existing ?? parsed;
-  base.contentId = parsed.contentId ?? base.contentId ?? inferEventContentId(base.id);
+  base.contentId = parsed.contentId ?? base.contentId ??
+    inferEventContentId(base.id);
   if (parsed.sourceUrl) base.sourceUrl = parsed.sourceUrl;
   if (parsed.slug) base.slug = parsed.slug;
   if (!existing || !existing.name || /^Event \d+$/.test(existing.name)) {
@@ -1882,7 +2333,9 @@ async function removeManualEvent(requested: string): Promise<boolean> {
     (!!normalizedRequested && contentIdFor(entry) === normalizedRequested)
   );
   if (!existing) return false;
-  config.manualEvents = config.manualEvents.filter((entry) => entry.id !== existing.id);
+  config.manualEvents = config.manualEvents.filter((entry) =>
+    entry.id !== existing.id
+  );
   streamCache.delete(existing.id);
   keyCache.delete(existing.id);
   clearRestartCooldown(existing.id);
@@ -1899,35 +2352,54 @@ function isM3u8(url: string, contentType: string | null): boolean {
 }
 
 function isDashManifest(url: string, contentType: string | null): boolean {
-  if (contentType?.includes("dash+xml") || contentType?.includes("application/xml") || contentType?.includes("text/xml")) {
+  if (
+    contentType?.includes("dash+xml") ||
+    contentType?.includes("application/xml") ||
+    contentType?.includes("text/xml")
+  ) {
     return true;
   }
   return /\.mpd(\?|$)/i.test(url);
 }
 
-function rewritePlaylist(body: string, baseUrl: string, proxyOrigin = ""): string {
+function rewritePlaylist(
+  body: string,
+  baseUrl: string,
+  proxyOrigin = "",
+): string {
   const proxyBase = `${proxyOrigin}/proxy?url=`;
   const proxy = (abs: string) => `${proxyBase}${encodeURIComponent(abs)}`;
   return body.split(/\r?\n/).map((line) => {
     if (!line) return line;
     if (line.startsWith("#")) {
       // rewrite URI="..." attributes inside tags (keys, maps, etc.)
-      return line.replace(/URI="([^"]+)"/g, (_m, u) => `URI="${proxy(new URL(u, baseUrl).toString())}"`);
+      return line.replace(
+        /URI="([^"]+)"/g,
+        (_m, u) => `URI="${proxy(new URL(u, baseUrl).toString())}"`,
+      );
     }
     return proxy(new URL(line, baseUrl).toString());
   }).join("\n");
 }
 
 function rewriteDashManifest(xml: string, baseUrl: string): string {
-  let rewritten = xml.replace(/<BaseURL>([\s\S]*?)<\/BaseURL>/gi, (_m, value) => {
-    const trimmed = String(value).trim();
-    if (!trimmed) return "<BaseURL></BaseURL>";
-    return `<BaseURL>${new URL(trimmed, baseUrl).toString()}</BaseURL>`;
-  });
-  rewritten = rewritten.replace(/\b(initialization|media|sourceURL|index)="([^"]+)"/g, (_m, attr, value) => {
-    if (!value || value.startsWith("data:") || value.startsWith("urn:")) return `${attr}="${value}"`;
-    return `${attr}="${new URL(value, baseUrl).toString()}"`;
-  });
+  let rewritten = xml.replace(
+    /<BaseURL>([\s\S]*?)<\/BaseURL>/gi,
+    (_m, value) => {
+      const trimmed = String(value).trim();
+      if (!trimmed) return "<BaseURL></BaseURL>";
+      return `<BaseURL>${new URL(trimmed, baseUrl).toString()}</BaseURL>`;
+    },
+  );
+  rewritten = rewritten.replace(
+    /\b(initialization|media|sourceURL|index)="([^"]+)"/g,
+    (_m, attr, value) => {
+      if (
+        !value || value.startsWith("data:") || value.startsWith("urn:")
+      ) return `${attr}="${value}"`;
+      return `${attr}="${new URL(value, baseUrl).toString()}"`;
+    },
+  );
   return rewritten;
 }
 
@@ -1965,10 +2437,17 @@ async function buildLivePlaylistFromInfo(
     );
   }
   const masterRes = await fetch(info.url, { headers: proxyFetchHeaders() });
-  if (!masterRes.ok) return new Response(`upstream ${masterRes.status}`, { status: masterRes.status });
+  if (!masterRes.ok) {
+    return new Response(`upstream ${masterRes.status}`, {
+      status: masterRes.status,
+    });
+  }
   const masterBody = await masterRes.text();
   if (!masterBody.trimStart().startsWith("#EXTM3U")) {
-    return new Response(`upstream is not HLS (got ${masterBody.slice(0, 40)}…)`, { status: 415 });
+    return new Response(
+      `upstream is not HLS (got ${masterBody.slice(0, 40)}…)`,
+      { status: 415 },
+    );
   }
 
   let baseUrl = info.url;
@@ -1988,7 +2467,11 @@ async function buildLivePlaylistFromInfo(
     if (best) {
       baseUrl = new URL(best.uri, info.url).toString();
       const varRes = await fetch(baseUrl, { headers: proxyFetchHeaders() });
-      if (!varRes.ok) return new Response(`variant ${varRes.status}`, { status: varRes.status });
+      if (!varRes.ok) {
+        return new Response(`variant ${varRes.status}`, {
+          status: varRes.status,
+        });
+      }
       body = await varRes.text();
     }
   }
@@ -2002,7 +2485,10 @@ function isRejectedHlsResponse(response: Response): boolean {
   return response.status === 401 || response.status === 403;
 }
 
-async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
+async function buildLivePlaylist(
+  channelId: string,
+  proxyOrigin: string,
+): Promise<Response> {
   const entry = resolveRequestedChannel(channelId);
   const cacheKey = entry?.id ?? channelId;
   const contentId = contentIdFor(entry ?? channelId);
@@ -2010,18 +2496,25 @@ async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promis
   let response = await buildLivePlaylistFromInfo(channelId, proxyOrigin, info);
   if (!isRejectedHlsResponse(response)) return response;
 
-  console.warn(`[hls] cached stream rejected for ${cacheKey} with ${response.status}; refreshing once`);
+  console.warn(
+    `[hls] cached stream rejected for ${cacheKey} with ${response.status}; refreshing once`,
+  );
   try {
     info = await getStreamInfo(cacheKey, true, contentId);
   } catch (error) {
-    console.error(`[hls] forced refresh failed for ${cacheKey}:`, (error as Error).message);
+    console.error(
+      `[hls] forced refresh failed for ${cacheKey}:`,
+      (error as Error).message,
+    );
     return playbackUnavailableResponse();
   }
 
   response = await buildLivePlaylistFromInfo(channelId, proxyOrigin, info);
   if (!isRejectedHlsResponse(response)) return response;
 
-  console.error(`[hls] refreshed stream rejected for ${cacheKey} with ${response.status}`);
+  console.error(
+    `[hls] refreshed stream rejected for ${cacheKey} with ${response.status}`,
+  );
   return playbackUnavailableResponse();
 }
 
@@ -2043,7 +2536,8 @@ function resolveRequestedChannel(requested: string): Channel | undefined {
 
   const decodedRequested = decodeURIComponent(requested).trim();
   const normalizedRequested = normalizeRequestedContentKey(decodedRequested);
-  const transientValue = normalizeTypedContentId(normalizedRequested) ?? (/^\d+$/.test(decodedRequested) ? decodedRequested : null);
+  const transientValue = normalizeTypedContentId(normalizedRequested) ??
+    (/^\d+$/.test(decodedRequested) ? decodedRequested : null);
   if (transientValue) {
     try {
       return parseManualEventInput(transientValue);
@@ -2100,7 +2594,9 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path === "/") {
-    return new Response(INDEX_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(INDEX_HTML, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
   }
 
   if (method === "GET" && path === "/api/channels") {
@@ -2117,7 +2613,9 @@ async function handle(req: Request): Promise<Response> {
       await ensureAuth(true);
       return Response.json({ ok: true, issuedAt: config.session.issuedAt });
     } catch (e) {
-      return Response.json({ ok: false, error: (e as Error).message }, { status: 500 });
+      return Response.json({ ok: false, error: (e as Error).message }, {
+        status: 500,
+      });
     }
   }
 
@@ -2127,7 +2625,9 @@ async function handle(req: Request): Promise<Response> {
       const entry = await addManualEvent(body.value ?? "");
       return Response.json({ ok: true, entry });
     } catch (e) {
-      return Response.json({ ok: false, error: (e as Error).message }, { status: 400 });
+      return Response.json({ ok: false, error: (e as Error).message }, {
+        status: 400,
+      });
     }
   }
 
@@ -2135,10 +2635,17 @@ async function handle(req: Request): Promise<Response> {
     const requested = decodeURIComponent(path.slice("/api/events/".length));
     try {
       const removed = await removeManualEvent(requested);
-      if (!removed) return Response.json({ ok: false, error: `unknown event: ${requested}` }, { status: 404 });
+      if (!removed) {
+        return Response.json({
+          ok: false,
+          error: `unknown event: ${requested}`,
+        }, { status: 404 });
+      }
       return Response.json({ ok: true });
     } catch (e) {
-      return Response.json({ ok: false, error: (e as Error).message }, { status: 500 });
+      return Response.json({ ok: false, error: (e as Error).message }, {
+        status: 500,
+      });
     }
   }
 
@@ -2157,7 +2664,9 @@ async function handle(req: Request): Promise<Response> {
           ? (includeDrm ? `http://${host}/vlc/${routePath}/index.m3u8` : null)
           : `http://${host}/live/${routePath}.m3u8`;
         if (!target) continue;
-        lines.push(`#EXTINF:-1 tvg-id="${ch.id}" tvg-logo="${ch.img}" group-title="Voyo",${ch.name}`);
+        lines.push(
+          `#EXTINF:-1 tvg-id="${ch.id}" tvg-logo="${ch.img}" group-title="Voyo",${ch.name}`,
+        );
         lines.push(target);
       }
       return new Response(lines.join("\n") + "\n", {
@@ -2169,11 +2678,15 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/live/") && path.endsWith(".m3u8")) {
-    const requested = decodeURIComponent(path.slice("/live/".length, -".m3u8".length));
+    const requested = decodeURIComponent(
+      path.slice("/live/".length, -".m3u8".length),
+    );
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      if (!ch) {
+        return new Response(`unknown channel: ${requested}`, { status: 404 });
+      }
       return await buildLivePlaylist(ch.id, url.origin);
     } catch (e) {
       console.error(`[live] ${requested}:`, (e as Error).message);
@@ -2187,8 +2700,16 @@ async function handle(req: Request): Promise<Response> {
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
-      const keys = await getKeys(ch.id, url.searchParams.get("force") === "1", contentIdFor(ch));
+      if (!ch) {
+        return Response.json({ error: `unknown channel: ${requested}` }, {
+          status: 404,
+        });
+      }
+      const keys = await getKeys(
+        ch.id,
+        url.searchParams.get("force") === "1",
+        contentIdFor(ch),
+      );
       return Response.json(keys);
     } catch (e) {
       return Response.json({ error: (e as Error).message }, { status: 500 });
@@ -2200,7 +2721,11 @@ async function handle(req: Request): Promise<Response> {
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
+      if (!ch) {
+        return Response.json({ error: `unknown channel: ${requested}` }, {
+          status: 404,
+        });
+      }
       if (url.searchParams.get("ensure") === "1") await ensureDrmState(ch.id);
       const state = drmStates.get(ch.id);
       const restartCooldown = getRestartCooldown(ch.id);
@@ -2210,7 +2735,10 @@ async function handle(req: Request): Promise<Response> {
           ? {
             failures: restartCooldown.failures,
             retryAfterAt: new Date(restartCooldown.retryAfterAt).toISOString(),
-            retryAfterSec: Math.max(0, Math.ceil((restartCooldown.retryAfterAt - Date.now()) / 1000)),
+            retryAfterSec: Math.max(
+              0,
+              Math.ceil((restartCooldown.retryAfterAt - Date.now()) / 1000),
+            ),
             lastReason: restartCooldown.lastReason,
             updatedAt: new Date(restartCooldown.updatedAt).toISOString(),
           }
@@ -2221,7 +2749,9 @@ async function handle(req: Request): Promise<Response> {
             workDir: state.workDir,
             lastAccess: new Date(state.lastAccess).toISOString(),
             createdAt: new Date(state.createdAt).toISOString(),
-            lastRefreshAt: state.lastRefreshAt ? new Date(state.lastRefreshAt).toISOString() : null,
+            lastRefreshAt: state.lastRefreshAt
+              ? new Date(state.lastRefreshAt).toISOString()
+              : null,
             lastError: state.lastError,
             downloadLoopState: state.downloadLoopState,
             syncIntervalMs: state.syncIntervalMs,
@@ -2248,11 +2778,17 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/api/drm-manifest/")) {
-    const requested = decodeURIComponent(path.slice("/api/drm-manifest/".length));
+    const requested = decodeURIComponent(
+      path.slice("/api/drm-manifest/".length),
+    );
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
+      if (!ch) {
+        return Response.json({ error: `unknown channel: ${requested}` }, {
+          status: 404,
+        });
+      }
       const state = drmStates.get(ch.id);
       if (state?.manifestXml && url.searchParams.get("force") !== "1") {
         return Response.json({
@@ -2262,8 +2798,16 @@ async function handle(req: Request): Promise<Response> {
           xml: state.manifestXml,
         });
       }
-      const info = await getStreamInfo(ch.id, url.searchParams.get("force") === "1", contentIdFor(ch));
-      if (!info.drm) return Response.json({ error: `channel ${requested} is not DRM` }, { status: 400 });
+      const info = await getStreamInfo(
+        ch.id,
+        url.searchParams.get("force") === "1",
+        contentIdFor(ch),
+      );
+      if (!info.drm) {
+        return Response.json({ error: `channel ${requested} is not DRM` }, {
+          status: 400,
+        });
+      }
       const snapshot = await fetchMpdSnapshot(info.url);
       return Response.json({
         channelId: ch.id,
@@ -2281,7 +2825,9 @@ async function handle(req: Request): Promise<Response> {
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      if (!ch) {
+        return new Response(`unknown channel: ${requested}`, { status: 404 });
+      }
       const kind = url.searchParams.get("file") ?? "pipeline";
       const workDir = `${LIVE_DIR}/${ch.id}`;
       const filePath = kind === "stdout"
@@ -2291,7 +2837,12 @@ async function handle(req: Request): Promise<Response> {
         : `${workDir}/logs/pipeline.log`;
       const body = await readTextIfExists(filePath);
       if (body == null) return new Response("log not found", { status: 404 });
-      return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+      return new Response(body, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
     } catch (e) {
       return new Response((e as Error).message, { status: 500 });
     }
@@ -2308,14 +2859,20 @@ async function handle(req: Request): Promise<Response> {
     }
     if (parts.length < 2) return new Response("bad path", { status: 400 });
     const typedRoute = parts.length >= 3 &&
-      VOYO_CONTENT_TYPES.includes(parts[0].toLowerCase() as typeof VOYO_CONTENT_TYPES[number]) &&
+      VOYO_CONTENT_TYPES.includes(
+        parts[0].toLowerCase() as typeof VOYO_CONTENT_TYPES[number],
+      ) &&
       /^\d+$/.test(parts[1]);
-    const requested = decodeURIComponent(typedRoute ? `${parts[0]}/${parts[1]}` : parts[0]);
+    const requested = decodeURIComponent(
+      typedRoute ? `${parts[0]}/${parts[1]}` : parts[0],
+    );
     const filename = (typedRoute ? parts.slice(2) : parts.slice(1)).join("/");
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      if (!ch) {
+        return new Response(`unknown channel: ${requested}`, { status: 404 });
+      }
       if (filename === "index.m3u8") {
         const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
         if (!info.isDrm) return await buildLivePlaylist(ch.id, url.origin);
@@ -2353,7 +2910,11 @@ async function handle(req: Request): Promise<Response> {
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return Response.json({ error: `unknown channel: ${requested}` }, { status: 404 });
+      if (!ch) {
+        return Response.json({ error: `unknown channel: ${requested}` }, {
+          status: 404,
+        });
+      }
       const info = await getStreamInfo(ch.id, false, contentIdFor(ch));
       return Response.json({
         id: ch.id,
@@ -2377,18 +2938,36 @@ async function handle(req: Request): Promise<Response> {
     try {
       await getChannels();
       const ch = resolveRequestedChannel(requested);
-      if (!ch) return new Response(`unknown channel: ${requested}`, { status: 404 });
+      if (!ch) {
+        return new Response(`unknown channel: ${requested}`, { status: 404 });
+      }
       let info = await getStreamInfo(ch.id, false, contentIdFor(ch));
-      if (!info.drm) return new Response(`channel ${requested} is not DRM`, { status: 400 });
+      if (!info.drm) {
+        return new Response(`channel ${requested} is not DRM`, { status: 400 });
+      }
       const body = await req.arrayBuffer();
-      let upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
+      let upstream = await fetch(info.drm.url, {
+        method: "POST",
+        headers: info.drm.headers,
+        body,
+      });
       if (upstream.status === 401 || upstream.status === 403) {
         // Signed URL or token went stale — refresh once.
         info = await getStreamInfo(ch.id, true, contentIdFor(ch));
-        if (info.drm) upstream = await fetch(info.drm.url, { method: "POST", headers: info.drm.headers, body });
+        if (info.drm) {
+          upstream = await fetch(info.drm.url, {
+            method: "POST",
+            headers: info.drm.headers,
+            body,
+          });
+        }
       }
-      const ct = upstream.headers.get("content-type") ?? "application/octet-stream";
-      return new Response(upstream.body, { status: upstream.status, headers: { "Content-Type": ct } });
+      const ct = upstream.headers.get("content-type") ??
+        "application/octet-stream";
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: { "Content-Type": ct },
+      });
     } catch (e) {
       console.error(`[license] ${requested}:`, (e as Error).message);
       return new Response((e as Error).message, { status: 502 });
@@ -2396,11 +2975,15 @@ async function handle(req: Request): Promise<Response> {
   }
 
   if (method === "GET" && path.startsWith("/play/")) {
-    return new Response(PLAY_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(PLAY_HTML, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
   }
 
   if (method === "GET" && path === "/mosaic") {
-    return new Response(MOSAIC_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(MOSAIC_HTML, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
   }
 
   if (method === "GET" && path === "/proxy") {
@@ -2424,7 +3007,15 @@ async function handle(req: Request): Promise<Response> {
         });
       }
       const headers = new Headers();
-      for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "cache-control"]) {
+      for (
+        const h of [
+          "content-type",
+          "content-length",
+          "content-range",
+          "accept-ranges",
+          "cache-control",
+        ]
+      ) {
         const v = upstream.headers.get(h);
         if (v) headers.set(h, v);
       }
@@ -2876,7 +3467,11 @@ if (!ids.length) {
   await ensureShakaPackager();
   console.log(`Voyo v2 Shaka → http://localhost:${PORT}`);
   console.log(`UI Basic Auth → ${UI_BASIC_AUTH_USER}:${UI_BASIC_AUTH_PASS}`);
-  console.log(`Live dir cleanup on shutdown → ${PRESERVE_LIVE_DIR ? "preserve" : "delete"}`);
+  console.log(
+    `Live dir cleanup on shutdown → ${
+      PRESERVE_LIVE_DIR ? "preserve" : "delete"
+    }`,
+  );
   if (!config.credentials.username) {
     console.log(`⚠  add credentials to ${CONFIG_PATH} then restart`);
   }
@@ -2899,7 +3494,10 @@ if (!ids.length) {
   Deno.addSignalListener("SIGTERM", () => {
     void gracefulShutdown("SIGTERM");
   });
-  const server = Deno.serve({ port: PORT, signal: shutdownController.signal }, handle);
+  const server = Deno.serve(
+    { port: PORT, signal: shutdownController.signal },
+    handle,
+  );
   await server.finished;
   if (!shuttingDown) {
     await disposeAllDrmStates("server stopped", !PRESERVE_LIVE_DIR);
