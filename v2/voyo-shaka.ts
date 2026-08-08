@@ -396,17 +396,49 @@ async function probeStreamKind(
 }
 
 // === Stream info cache (signed URLs expire; keep live playback fresh) ===
-const STREAM_TTL_MS = 5 * 60 * 1000;
+const STREAM_TTL_MS = 30 * 60 * 1000;
+const STREAM_REFRESH_RETRY_MS = 60 * 1000;
 const streamCache = new Map<string, { info: StreamInfo; expiresAt: number }>();
+const streamRefreshes = new Map<string, Promise<StreamInfo>>();
+
+function isTemporaryStreamRefreshError(error: unknown): boolean {
+  if (!(error instanceof HttpError)) return true;
+  return error.status === 401 || error.status === 403 || error.status === 429 || error.status >= 500;
+}
+
+function refreshStreamInfo(cacheKey: string, contentId: string): Promise<StreamInfo> {
+  const inFlight = streamRefreshes.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const refresh = withAuth((t, u) => resolveStream(contentId, t, u))
+    .then((info) => {
+      streamCache.set(cacheKey, { info, expiresAt: Date.now() + STREAM_TTL_MS });
+      return info;
+    })
+    .finally(() => {
+      if (streamRefreshes.get(cacheKey) === refresh) streamRefreshes.delete(cacheKey);
+    });
+  streamRefreshes.set(cacheKey, refresh);
+  return refresh;
+}
 
 async function getStreamInfo(cacheKey: string, force = false, contentId = cacheKey): Promise<StreamInfo> {
-  if (!force) {
-    const hit = streamCache.get(cacheKey);
-    if (hit && hit.expiresAt > Date.now()) return hit.info;
+  const hit = streamCache.get(cacheKey);
+  if (!force && hit && hit.expiresAt > Date.now()) return hit.info;
+
+  try {
+    return await refreshStreamInfo(cacheKey, contentId);
+  } catch (error) {
+    if (!force && hit && isTemporaryStreamRefreshError(error)) {
+      const now = Date.now();
+      if (hit.expiresAt <= now) {
+        hit.expiresAt = now + STREAM_REFRESH_RETRY_MS;
+        console.warn(`[stream-cache] refresh failed for ${cacheKey}; using cached stream:`, (error as Error).message);
+      }
+      return hit.info;
+    }
+    throw error;
   }
-  const info = await withAuth((t, u) => resolveStream(contentId, t, u));
-  streamCache.set(cacheKey, { info, expiresAt: Date.now() + STREAM_TTL_MS });
-  return info;
 }
 
 // === Widevine: PSSH extraction + CDM sidecar client + key cache ===
@@ -664,6 +696,19 @@ function responseForError(error: unknown, fallbackStatus = 500, asJson = false):
   return asJson
     ? Response.json({ error: message }, { status: fallbackStatus })
     : new Response(message, { status: fallbackStatus });
+}
+
+function playbackUnavailableResponse(): Response {
+  return new Response("stream temporarily unavailable", {
+    status: 503,
+    headers: { "Retry-After": "60" },
+  });
+}
+
+function responseForPlaybackError(error: unknown): Response {
+  if (error instanceof RestartCooldownError) return responseForError(error);
+  if (isTemporaryStreamRefreshError(error)) return playbackUnavailableResponse();
+  return responseForError(error);
 }
 
 async function clearDir(dir: string): Promise<void> {
@@ -1908,9 +1953,11 @@ function proxyFetchHeaders(req?: Request): HeadersInit {
   return headers;
 }
 
-async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
-  const entry = resolveRequestedChannel(channelId);
-  const info = await getStreamInfo(entry?.id ?? channelId, false, contentIdFor(entry ?? channelId));
+async function buildLivePlaylistFromInfo(
+  channelId: string,
+  proxyOrigin: string,
+  info: StreamInfo,
+): Promise<Response> {
   if (info.isDrm) {
     return new Response(
       `channel ${channelId} is DRM (DASH+Widevine); open /play/${channelId} in Chrome instead`,
@@ -1949,6 +1996,33 @@ async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promis
   return new Response(rewritePlaylist(body, baseUrl, proxyOrigin), {
     headers: { "Content-Type": "application/vnd.apple.mpegurl" },
   });
+}
+
+function isRejectedHlsResponse(response: Response): boolean {
+  return response.status === 401 || response.status === 403;
+}
+
+async function buildLivePlaylist(channelId: string, proxyOrigin: string): Promise<Response> {
+  const entry = resolveRequestedChannel(channelId);
+  const cacheKey = entry?.id ?? channelId;
+  const contentId = contentIdFor(entry ?? channelId);
+  let info = await getStreamInfo(cacheKey, false, contentId);
+  let response = await buildLivePlaylistFromInfo(channelId, proxyOrigin, info);
+  if (!isRejectedHlsResponse(response)) return response;
+
+  console.warn(`[hls] cached stream rejected for ${cacheKey} with ${response.status}; refreshing once`);
+  try {
+    info = await getStreamInfo(cacheKey, true, contentId);
+  } catch (error) {
+    console.error(`[hls] forced refresh failed for ${cacheKey}:`, (error as Error).message);
+    return playbackUnavailableResponse();
+  }
+
+  response = await buildLivePlaylistFromInfo(channelId, proxyOrigin, info);
+  if (!isRejectedHlsResponse(response)) return response;
+
+  console.error(`[hls] refreshed stream rejected for ${cacheKey} with ${response.status}`);
+  return playbackUnavailableResponse();
 }
 
 function findChannel(requested: string): Channel | undefined {
@@ -2103,7 +2177,7 @@ async function handle(req: Request): Promise<Response> {
       return await buildLivePlaylist(ch.id, url.origin);
     } catch (e) {
       console.error(`[live] ${requested}:`, (e as Error).message);
-      return new Response((e as Error).message, { status: 500 });
+      return responseForPlaybackError(e);
     }
   }
 
@@ -2268,7 +2342,7 @@ async function handle(req: Request): Promise<Response> {
       return await serveDrmOutputFile(ch.id, filename);
     } catch (e) {
       console.error(`[vlc] ${requested}/${filename}:`, (e as Error).message);
-      return responseForError(e);
+      return responseForPlaybackError(e);
     }
   }
 
