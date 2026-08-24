@@ -46,6 +46,7 @@ Helper scripts in this folder:
 - [setup-ubuntu-vps.sh](/Users/flav/Downloads/iptvro_v2-main/v2/setup-ubuntu-vps.sh) installs Docker Engine, Buildx, and Compose on a fresh Ubuntu 24 server
 - [build-push-ghcr.sh](/Users/flav/Downloads/iptvro_v2-main/v2/build-push-ghcr.sh) builds and pushes a private GHCR runtime image from your Mac
 - [pull-run-ghcr.sh](/Users/flav/Downloads/iptvro_v2-main/v2/pull-run-ghcr.sh) pulls that image on Ubuntu and starts the container
+- `deploy-on-vps.sh` builds and pushes the image from your Mac, then updates `lui-alexhost-voyo` in one command
 
 ### Docker quick start
 
@@ -218,6 +219,23 @@ sudo ufw allow 443/tcp
 The Caddy certificate and configuration state are persisted in Docker volumes.
 Future app updates use the same command after loading `.env`; the script safely
 recreates both containers while retaining the certificate data.
+
+For subsequent deployments from the repository root, run:
+
+```sh
+bash v2/deploy-on-vps.sh
+```
+
+The script loads `v2/.env`, builds and pushes the `linux/amd64` runtime image from
+your Mac, copies `pull-run-ghcr.sh` to `/root/voyo`, securely synchronizes the
+GHCR credentials over SSH, and starts the application plus Caddy. No Git remote
+or GitHub Actions workflow is required.
+
+To redeploy the already-pushed image without rebuilding it:
+
+```sh
+bash v2/deploy-on-vps.sh --skip-build
+```
 
 Custom host port and UI credentials:
 
