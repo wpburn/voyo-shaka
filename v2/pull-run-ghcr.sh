@@ -90,7 +90,7 @@ if [ -n "${HTTPS_DOMAIN}" ]; then
     -v voyo-caddy-data:/data \
     -v voyo-caddy-config:/config \
     "${CADDY_IMAGE}" \
-    reverse-proxy \
+    caddy reverse-proxy \
     --from "${HTTPS_DOMAIN}" \
     --to "127.0.0.1:${HOST_PORT}"
 fi
