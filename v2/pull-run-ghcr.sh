@@ -11,6 +11,9 @@ HOST_PORT="${HOST_PORT:-8090}"
 UI_USER="${UI_USER:-adm}"
 UI_PASS="${UI_PASS:-fvoyo}"
 PRESERVE_LIVE_DIR="${VOYO_PRESERVE_LIVE_DIR:-0}"
+HTTPS_DOMAIN="${HTTPS_DOMAIN:-}"
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2}"
+CADDY_CONTAINER_NAME="${CADDY_CONTAINER_NAME:-voyo-caddy}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -35,6 +38,11 @@ fi
 
 if [ -z "${GHCR_PAT}" ]; then
   echo "GHCR_PAT is required" >&2
+  exit 1
+fi
+
+if [ -n "${HTTPS_DOMAIN}" ] && ! [[ "${HTTPS_DOMAIN}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "HTTPS_DOMAIN must be a hostname without a scheme, path, or port" >&2
   exit 1
 fi
 
@@ -68,6 +76,25 @@ docker run -d \
   -e VOYO_UI_BASIC_AUTH_PASS="${UI_PASS}" \
   "${IMAGE_REF}"
 
+if [ -n "${HTTPS_DOMAIN}" ]; then
+  docker pull "${CADDY_IMAGE}"
+
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "${CADDY_CONTAINER_NAME}"; then
+    docker rm -f "${CADDY_CONTAINER_NAME}"
+  fi
+
+  docker run -d \
+    --name "${CADDY_CONTAINER_NAME}" \
+    --restart unless-stopped \
+    --network host \
+    -v voyo-caddy-data:/data \
+    -v voyo-caddy-config:/config \
+    "${CADDY_IMAGE}" \
+    reverse-proxy \
+    --from "${HTTPS_DOMAIN}" \
+    --to "127.0.0.1:${HOST_PORT}"
+fi
+
 sleep 3
 
 echo
@@ -75,7 +102,15 @@ echo "Container started: ${CONTAINER_NAME}"
 echo "Image:             ${IMAGE_REF}"
 echo "UI:                http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/"
 echo "VLC:               http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/vlc/channel-179/index.m3u8"
+if [ -n "${HTTPS_DOMAIN}" ]; then
+  echo "HTTPS UI:          https://${HTTPS_DOMAIN}/"
+fi
 echo
 docker ps --filter "name=${CONTAINER_NAME}"
+if [ -n "${HTTPS_DOMAIN}" ]; then
+  docker ps --filter "name=${CADDY_CONTAINER_NAME}"
+  echo
+  docker logs --tail 30 "${CADDY_CONTAINER_NAME}"
+fi
 echo
 docker logs --tail 50 "${CONTAINER_NAME}"

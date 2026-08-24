@@ -124,6 +124,7 @@ cd /path/to/iptvro_v2-main/v2
 cat > .env <<'EOF'
 GHCR_USER=prog-322
 GHCR_PAT=your-new-ghcr-token
+HTTPS_DOMAIN=vyoo.duckdns.org
 EOF
 ```
 
@@ -191,12 +192,32 @@ ssh user@your-server
 cat > .env <<'EOF'
 GHCR_USER=prog-322
 GHCR_PAT=your-new-ghcr-token
+HTTPS_DOMAIN=vyoo.duckdns.org
 EOF
 set -a
 source .env
 set +a
 bash pull-run-ghcr.sh
 ```
+
+When `HTTPS_DOMAIN` is set, the script also starts a Caddy container that obtains
+and renews a public TLS certificate automatically. It keeps the app exposed on
+port `8090`, so both addresses continue to work:
+
+- browser/Shaka: `https://vyoo.duckdns.org/`
+- direct HTTP/VLC: `http://81.180.93.33:8090/`
+
+Before the first HTTPS run, allow ports 80 and 443 in UFW (and in the VPS
+provider firewall, if it has one):
+
+```sh
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+```
+
+The Caddy certificate and configuration state are persisted in Docker volumes.
+Future app updates use the same command after loading `.env`; the script safely
+recreates both containers while retaining the certificate data.
 
 Custom host port and UI credentials:
 

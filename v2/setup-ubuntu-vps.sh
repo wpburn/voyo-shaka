@@ -52,6 +52,8 @@ if [ "${INSTALL_UFW}" = "1" ]; then
   apt-get install -y --no-install-recommends ufw
   ufw allow OpenSSH
   ufw allow "${APP_PORT}/tcp"
+  ufw allow 80/tcp
+  ufw allow 443/tcp
   ufw --force enable
 fi
 
