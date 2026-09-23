@@ -23,6 +23,24 @@ type Channel = {
   streamKind?: "drm" | "hls" | "unknown";
   lastCheckedAt?: string | null;
   lastError?: string | null;
+  discoveryScope?: DiscoveryScope;
+  releaseDateLabel?: string | null;
+  liveLabel?: string | null;
+};
+export type DiscoveryScope = "sport" | "premier-league";
+export type DiscoveryResponse = {
+  scope: DiscoveryScope;
+  categoryId: string;
+  fetchedAt: string | null;
+  freshness: "fresh" | "stale" | "empty";
+  entries: Channel[];
+  refreshError: string | null;
+};
+type DiscoverySnapshot = {
+  scope: DiscoveryScope;
+  categoryId: string;
+  fetchedAt: string;
+  entries: Channel[];
 };
 type StreamInfo = {
   url: string;
@@ -104,6 +122,11 @@ const LEGACY_CONFIG_PATH = `${CONFIG_DIR}/../configs/voyo.json`;
 const API_BASE = "https://apivoyo.cms.protvplus.ro";
 const AUTH_REFRESH_MS = 6 * 60 * 60 * 1000;
 const CHANNELS_REFRESH_MS = 12 * 60 * 60 * 1000;
+const VOYO_SPORT_CATEGORY_ID = "6";
+const VOYO_PREMIER_LEAGUE_CATEGORY_ID = readCategoryId(
+  Deno.env.get("VOYO_PREMIER_LEAGUE_CATEGORY_ID"),
+  "334",
+);
 const SALT_B64 =
   "ZGtkZjM1ZzYhIHtjb250ZW50fXxwbGF5c3xuZzhyNWUzMSF8e3NlcnZlclRpbWV9ISNpM2R0JjQzQA==";
 const UI_BASIC_AUTH_USER = Deno.env.get("VOYO_UI_BASIC_AUTH_USER") ?? "adm";
@@ -111,6 +134,11 @@ const UI_BASIC_AUTH_PASS = Deno.env.get("VOYO_UI_BASIC_AUTH_PASS") ?? "fvoyo";
 const PRESERVE_LIVE_DIR = /^(1|true|yes)$/i.test(
   Deno.env.get("VOYO_PRESERVE_LIVE_DIR") ?? "",
 );
+
+function readCategoryId(value: string | undefined, fallback: string): string {
+  const normalized = value?.trim();
+  return normalized && /^\d+$/.test(normalized) ? normalized : fallback;
+}
 
 function deviceHeaders(uuid: string, token?: string): Record<string, string> {
   const h: Record<string, string> = {
@@ -165,6 +193,7 @@ function isUiProtectedRoute(path: string, method: string): boolean {
   if (
     method === "GET" &&
     (path.startsWith("/play/") || path.startsWith("/api/channels") ||
+      path.startsWith("/api/discovery/") ||
       path.startsWith("/api/stream/"))
   ) {
     return true;
@@ -239,6 +268,196 @@ async function listChannels(token: string, uuid: string): Promise<Channel[]> {
     img: c.logo?.replace("{WIDTH}x{HEIGHT}", "1920x1080") ?? "",
     slug: slugify(c.name),
   }));
+}
+
+type VoyoOverviewSection = {
+  name?: unknown;
+  content?: unknown;
+  items?: unknown;
+};
+
+async function listOverviewSections(
+  categoryId: string,
+  token: string,
+  uuid: string,
+): Promise<VoyoOverviewSection[]> {
+  const res = await fetch(
+    `${API_BASE}/api/v1/overview?category=${encodeURIComponent(categoryId)}`,
+    { headers: deviceHeaders(uuid, token) },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, `overview ${categoryId}: ${res.status}`);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!Array.isArray(data?.sections)) {
+    throw new Error(`overview ${categoryId}: sections missing`);
+  }
+  return data.sections;
+}
+
+const DISCOVERY_DEFINITIONS: Record<
+  DiscoveryScope,
+  { categoryId: string; sectionName: string }
+> = {
+  sport: {
+    categoryId: VOYO_SPORT_CATEGORY_ID,
+    sectionName: "Sport Live",
+  },
+  "premier-league": {
+    categoryId: VOYO_PREMIER_LEAGUE_CATEGORY_ID,
+    sectionName: "Premier League Live",
+  },
+};
+
+function sizedVoyoImage(value: unknown): string {
+  return typeof value === "string"
+    ? value.replace("{WIDTH}x{HEIGHT}", "1920x1080")
+    : "";
+}
+
+function discoveryItemContent(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  return item.content && typeof item.content === "object"
+    ? item.content as Record<string, unknown>
+    : item;
+}
+
+function discoveryLiveLabel(item: Record<string, unknown>): string | null {
+  if (typeof item.liveLabel === "string" && item.liveLabel.trim()) {
+    return item.liveLabel.trim();
+  }
+  if (!Array.isArray(item.labels)) return null;
+  const label = item.labels.find((value) => {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Record<string, unknown>;
+    return (typeof candidate.type === "string" &&
+      candidate.type.toLowerCase().includes("live")) ||
+      (typeof candidate.text === "string" &&
+        /\blive\b/i.test(candidate.text));
+  }) as Record<string, unknown> | undefined;
+  return typeof label?.text === "string" && label.text.trim()
+    ? label.text.trim()
+    : null;
+}
+
+export function parseDiscoveryEntries(
+  sections: VoyoOverviewSection[],
+  scope: DiscoveryScope,
+): Channel[] {
+  const definition = DISCOVERY_DEFINITIONS[scope];
+  const expectedName = definition.sectionName.toLocaleLowerCase();
+  const section = sections.find((candidate) =>
+    typeof candidate?.name === "string" &&
+    candidate.name.trim().toLocaleLowerCase() === expectedName
+  );
+  if (!section) {
+    throw new Error(`expected section not found: ${definition.sectionName}`);
+  }
+  const values = Array.isArray(section.content)
+    ? section.content
+    : Array.isArray(section.items)
+    ? section.items
+    : null;
+  if (!values) {
+    throw new Error(`section ${definition.sectionName}: items missing`);
+  }
+
+  const entries = new Map<string, Channel>();
+  for (const value of values) {
+    const item = discoveryItemContent(value);
+    if (!item) continue;
+    const rawId = typeof item.id === "string" ? item.id : "";
+    const contentId = normalizeTypedContentId(rawId);
+    if (!contentId || !contentId.startsWith("episode.")) continue;
+    if (entries.has(contentId)) continue;
+    const id = publicContentRouteId(contentId);
+    const name = typeof item.title === "string" && item.title.trim()
+      ? item.title.trim()
+      : `Event ${extractNumericContentTail(contentId) ?? contentId}`;
+    entries.set(contentId, {
+      id,
+      contentId,
+      name,
+      img: sizedVoyoImage(item.image),
+      slug: slugify(name),
+      kind: "event",
+      sourceUrl: null,
+      streamKind: "unknown",
+      lastCheckedAt: null,
+      lastError: null,
+      discoveryScope: scope,
+      releaseDateLabel: typeof item.releaseDateLabel === "string"
+        ? item.releaseDateLabel
+        : null,
+      liveLabel: discoveryLiveLabel(item),
+    });
+  }
+  return [...entries.values()];
+}
+
+type DiscoverySectionFetcher = (
+  scope: DiscoveryScope,
+  categoryId: string,
+) => Promise<VoyoOverviewSection[]>;
+
+export class DiscoveryStore {
+  #snapshots = new Map<DiscoveryScope, DiscoverySnapshot>();
+  #refreshes = new Map<DiscoveryScope, Promise<DiscoveryResponse>>();
+
+  constructor(private fetchSections: DiscoverySectionFetcher) {}
+
+  entries(): Channel[] {
+    return [...this.#snapshots.values()].flatMap((snapshot) =>
+      snapshot.entries
+    );
+  }
+
+  get(scope: DiscoveryScope, force = false): Promise<DiscoveryResponse> {
+    const snapshot = this.#snapshots.get(scope);
+    if (!force && snapshot) return Promise.resolve(this.#response(snapshot));
+    const inFlight = this.#refreshes.get(scope);
+    if (inFlight) return inFlight;
+
+    const definition = DISCOVERY_DEFINITIONS[scope];
+    const refresh = this.fetchSections(scope, definition.categoryId)
+      .then((sections) => {
+        const next: DiscoverySnapshot = {
+          scope,
+          categoryId: definition.categoryId,
+          fetchedAt: new Date().toISOString(),
+          entries: parseDiscoveryEntries(sections, scope),
+        };
+        this.#snapshots.set(scope, next);
+        return this.#response(next);
+      })
+      .catch((error) => {
+        const previous = this.#snapshots.get(scope);
+        return {
+          scope,
+          categoryId: definition.categoryId,
+          fetchedAt: previous?.fetchedAt ?? null,
+          freshness: previous ? "stale" : "empty",
+          entries: previous?.entries ?? [],
+          refreshError: error instanceof Error ? error.message : String(error),
+        } satisfies DiscoveryResponse;
+      })
+      .finally(() => {
+        if (this.#refreshes.get(scope) === refresh) {
+          this.#refreshes.delete(scope);
+        }
+      });
+    this.#refreshes.set(scope, refresh);
+    return refresh;
+  }
+
+  #response(snapshot: DiscoverySnapshot): DiscoveryResponse {
+    return {
+      ...snapshot,
+      freshness: "fresh",
+      refreshError: null,
+    };
+  }
 }
 
 async function resolveStream(
@@ -2029,20 +2248,22 @@ async function ensureDrmState(channelId: string): Promise<DrmChannelState> {
   }
 }
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, state] of drmStates) {
-    if (now - state.lastAccess > PIPE_IDLE_MS) {
-      void disposeState(
-        state,
-        `idle ${Math.round((now - state.lastAccess) / 1000)}s`,
-        true,
-      ).catch(() => {
-        drmStates.delete(id);
-      });
+if (import.meta.main) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, state] of drmStates) {
+      if (now - state.lastAccess > PIPE_IDLE_MS) {
+        void disposeState(
+          state,
+          `idle ${Math.round((now - state.lastAccess) / 1000)}s`,
+          true,
+        ).catch(() => {
+          drmStates.delete(id);
+        });
+      }
     }
-  }
-}, 15_000);
+  }, 15_000);
+}
 
 async function collectFiles(root: string, prefix = ""): Promise<string[]> {
   const out: string[] = [];
@@ -2240,6 +2461,10 @@ async function withAuth<T>(
   }
 }
 
+const discoveryStore = new DiscoveryStore((_scope, categoryId) =>
+  withAuth((token, uuid) => listOverviewSections(categoryId, token, uuid))
+);
+
 async function getChannels(force = false): Promise<Channel[]> {
   const stale = !config.channelsUpdatedAt ||
     Date.now() - new Date(config.channelsUpdatedAt).getTime() >
@@ -2254,7 +2479,18 @@ async function getChannels(force = false): Promise<Channel[]> {
 }
 
 function allEntries(): Channel[] {
-  return [...config.manualEvents, ...config.channels];
+  const entries = new Map<string, Channel>();
+  for (
+    const entry of [
+      ...config.manualEvents,
+      ...config.channels,
+      ...discoveryStore.entries(),
+    ]
+  ) {
+    const key = normalizeTypedContentId(contentIdFor(entry)) ?? entry.id;
+    if (!entries.has(key)) entries.set(key, entry);
+  }
+  return [...entries.values()];
 }
 
 async function refreshManualEvents(force = false): Promise<void> {
@@ -2286,7 +2522,7 @@ async function refreshManualEvents(force = false): Promise<void> {
 
 async function getEntries(force = false): Promise<Channel[]> {
   if (config.manualEvents.length > 0) await refreshManualEvents(force);
-  return allEntries();
+  return [...config.manualEvents, ...config.channels];
 }
 
 async function addManualEvent(value: string): Promise<Channel> {
@@ -2608,6 +2844,22 @@ async function handle(req: Request): Promise<Response> {
     }
   }
 
+  if (method === "GET" && path.startsWith("/api/discovery/")) {
+    const scope = path.slice("/api/discovery/".length) as DiscoveryScope;
+    if (scope !== "sport" && scope !== "premier-league") {
+      return Response.json({ error: `unknown discovery scope: ${scope}` }, {
+        status: 404,
+      });
+    }
+    const result = await discoveryStore.get(
+      scope,
+      url.searchParams.get("force") === "1",
+    );
+    return Response.json(result, {
+      status: result.freshness === "empty" && result.refreshError ? 502 : 200,
+    });
+  }
+
   if (method === "POST" && path === "/api/login") {
     try {
       await ensureAuth(true);
@@ -2656,7 +2908,8 @@ async function handle(req: Request): Promise<Response> {
     try {
       const mode = url.searchParams.get("mode") ?? "all";
       const includeDrm = mode === "all" || mode === "vlc";
-      const channels = await getChannels();
+      await getChannels();
+      const channels = allEntries();
       const lines = ["#EXTM3U"];
       for (const ch of channels) {
         const routePath = publicRoutePathFor(ch);
@@ -3043,9 +3296,16 @@ const INDEX_HTML = `<!doctype html>
   header h1 { font-size: 16px; margin: 0; margin-right: auto; }
   .eventbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .eventbar input { width: min(460px, 44vw); padding: 7px 10px; border-radius: 6px; border: 1px solid #2a3142; background: #10141c; color: #d7e3ff; font: inherit; }
+  .discoverbar { padding: 12px 20px; display: flex; gap: 10px; flex-wrap: wrap; border-bottom: 1px solid #222; }
+  .discovery { margin: 0 20px 20px; border: 1px solid #222936; border-radius: 8px; overflow: hidden; }
+  .discovery h2 { margin: 0; padding: 10px 14px; background: #151923; font-size: 14px; display: flex; align-items: center; gap: 10px; }
+  .discovery-status { margin-left: auto; font: 11px ui-monospace, SFMono-Regular, monospace; opacity: .65; }
+  .discovery-status.err { opacity: 1; }
+  .discovery table { background: #101319; }
   button { background: #1e2230; border: 1px solid #2a3142; color: #e6e9ef; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
   button:hover { background: #252b3c; }
   button:active { transform: translateY(1px); }
+  button:disabled { cursor: wait; opacity: .55; }
   .combo { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; opacity: .7; }
   .combo a { color: #8ab4f8; }
   table { width: 100%; border-collapse: collapse; }
@@ -3078,6 +3338,18 @@ const INDEX_HTML = `<!doctype html>
     <button id="addEvent" title="Add temporary Voyo event">＋ Add event</button>
   </div>
 </header>
+<div class="discoverbar">
+  <button id="discoverSport">⚽ Discover Sport</button>
+  <button id="discoverPremierLeague">🏆 Discover Premier League</button>
+</div>
+<section class="discovery">
+  <h2>Sport Live <span id="sportStatus" class="discovery-status">Not loaded</span></h2>
+  <table><tbody id="sportRows"><tr><td colspan="3" class="empty">Use Discover Sport to load events.</td></tr></tbody></table>
+</section>
+<section class="discovery">
+  <h2>Premier League Live <span id="premierLeagueStatus" class="discovery-status">Not loaded</span></h2>
+  <table><tbody id="premierLeagueRows"><tr><td colspan="3" class="empty">Use Discover Premier League to load events.</td></tr></tbody></table>
+</section>
 <table>
   <tbody id="rows"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
 </table>
@@ -3085,6 +3357,21 @@ const INDEX_HTML = `<!doctype html>
 <script>
 const rows = document.getElementById('rows');
 const toastEl = document.getElementById('toast');
+const discoveryViews = {
+  sport: {
+    button: document.getElementById('discoverSport'),
+    rows: document.getElementById('sportRows'),
+    status: document.getElementById('sportStatus'),
+  },
+  'premier-league': {
+    button: document.getElementById('discoverPremierLeague'),
+    rows: document.getElementById('premierLeagueRows'),
+    status: document.getElementById('premierLeagueStatus'),
+  },
+};
+const esc = (value) => String(value == null ? '' : value)
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 function toast(msg, isErr) {
   toastEl.textContent = msg;
   toastEl.classList.toggle('err', !!isErr);
@@ -3098,13 +3385,13 @@ async function load(force) {
     const r = await fetch('/api/channels' + (force ? '?force=1' : ''));
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
-    render(data.channels);
+    render(data.channels, rows, 'No channels yet — try Re-login then Refresh.');
   } catch (e) {
     rows.innerHTML = '<tr><td colspan="3" class="empty err">Error: ' + e.message + '</td></tr>';
   }
 }
-function render(channels) {
-  if (!channels.length) { rows.innerHTML = '<tr><td colspan="3" class="empty">No channels yet — try Re-login then Refresh.</td></tr>'; return; }
+function render(channels, target, emptyText) {
+  if (!channels.length) { target.innerHTML = '<tr><td colspan="3" class="empty">' + esc(emptyText || 'No events found.') + '</td></tr>'; return; }
   const isDrm = (c) => c.streamKind === 'drm' || (c.streamKind !== 'hls' && (c.kind === 'event' || /drm|cetin|widevine/i.test(c.name)));
   const routePath = (c) => {
     if (c.kind === 'event' && c.contentId) {
@@ -3114,33 +3401,38 @@ function render(channels) {
     return c.id;
   };
   const canClipboard = !!(window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText);
-  rows.innerHTML = channels.map(c => {
+  target.innerHTML = channels.map(c => {
     const drm = isDrm(c);
     const route = routePath(c);
-    const img = c.img ? '<img class="logo" src="' + c.img + '" loading="lazy" alt="">' : '';
-    const lock = drm ? '<span class="lock" title="DRM — VLC link uses server-side decrypt via cdm.py">🔒</span>' : '';
-    const marker = c.kind === 'event' ? '<span class="lock" title="Temporary manual event">📍</span>' : '';
-    const meta = c.kind === 'event'
-      ? '<span class="meta">' + (c.sourceUrl ? '<a href="' + c.sourceUrl + '" target="_blank">source</a>' : 'manual event') + (c.lastError ? ' • ' + c.lastError : '') + '</span>'
-      : '';
+    const img = c.img ? '<img class="logo" src="' + esc(c.img) + '" loading="lazy" alt="">' : '';
+    const lock = drm ? '<span class="lock" title="DRM — VLC link uses server-side decryption">🔒</span>' : '';
+    const marker = c.discoveryScope
+      ? '<span class="lock" title="Discovered event">✨</span>'
+      : (c.kind === 'event' ? '<span class="lock" title="Temporary manual event">📍</span>' : '');
+    const discoveredMeta = [c.liveLabel, c.releaseDateLabel].filter(Boolean).map(esc).join(' • ');
+    const meta = c.discoveryScope
+      ? '<span class="meta">' + (discoveredMeta || 'discovered event') + '</span>'
+      : (c.kind === 'event'
+        ? '<span class="meta">' + (c.sourceUrl ? '<a href="' + esc(c.sourceUrl) + '" target="_blank">source</a>' : 'manual event') + (c.lastError ? ' • ' + esc(c.lastError) : '') + '</span>'
+        : '');
     // For DRM channels the VLC-friendly URL is the server-decrypted /vlc/<id>/index.m3u8.
     const hls = drm ? '/vlc/' + route + '/index.m3u8' : '/live/' + route + '.m3u8';
     const fullHls = location.protocol + '//' + location.host + hls;
     const play = '/play/' + route;
     return '<tr>' +
       '<td style="width:80px">' + img + '</td>' +
-      '<td><label><input type="checkbox" class="pick" data-id="' + c.id + '" data-name="' + c.name + '"> <span class="name">' + c.name + '</span>' + lock + marker + '</label>' + meta + '</td>' +
+      '<td><label><input type="checkbox" class="pick" data-id="' + esc(c.id) + '" data-name="' + esc(c.name) + '"> <span class="name">' + esc(c.name) + '</span>' + lock + marker + '</label>' + meta + '</td>' +
       '<td class="actions">' +
         '<a href="' + play + '" target="_blank">▶ Play</a>' +
         '<a href="' + hls + '" target="_blank" data-url="' + hls + '">' + (drm ? '.m3u8 (VLC)' : '.m3u8') + '</a>' +
-        '<button data-action="copy" data-id="' + c.id + '" data-url="' + hls + '">' + (canClipboard ? '📋 Copy URL' : '📋 Select URL') + '</button>' +
-        (c.kind === 'event' ? '<button data-action="remove-event" data-id="' + c.id + '">✕ Remove</button>' : '') +
-        (canClipboard ? '' : '<input class="manual-url" type="text" readonly value="' + fullHls + '" data-manual-url>') +
+        '<button data-action="copy" data-id="' + esc(c.id) + '" data-url="' + esc(hls) + '">' + (canClipboard ? '📋 Copy URL' : '📋 Select URL') + '</button>' +
+        (c.kind === 'event' && !c.discoveryScope ? '<button data-action="remove-event" data-id="' + esc(c.id) + '">✕ Remove</button>' : '') +
+        '<input class="manual-url" type="text" readonly value="' + esc(fullHls) + '" data-manual-url>' +
       '</td>' +
     '</tr>';
   }).join('');
 }
-rows.addEventListener('click', (e) => {
+document.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-action][data-id]');
   if (!btn) return;
   if (btn.dataset.action === 'remove-event') {
@@ -3168,6 +3460,35 @@ rows.addEventListener('click', (e) => {
     toast(url);
   }
 });
+async function loadDiscovery(scope) {
+  const view = discoveryViews[scope];
+  view.button.disabled = true;
+  view.status.textContent = 'Refreshing…';
+  view.status.classList.remove('err');
+  try {
+    const r = await fetch('/api/discovery/' + scope + '?force=1');
+    const data = await r.json();
+    if (!r.ok && !Array.isArray(data.entries)) {
+      throw new Error(data.error || data.refreshError || ('HTTP ' + r.status));
+    }
+    render(data.entries || [], view.rows, 'No live events found.');
+    const fetched = data.fetchedAt ? new Date(data.fetchedAt).toLocaleString() : 'never';
+    if (data.freshness === 'stale' || data.refreshError) {
+      view.status.textContent = 'Stale (' + fetched + '): ' + (data.refreshError || 'refresh failed');
+      view.status.classList.add('err');
+    } else if (data.freshness === 'empty') {
+      view.status.textContent = 'Refresh failed: ' + (data.refreshError || 'no data');
+      view.status.classList.add('err');
+    } else {
+      view.status.textContent = 'Fresh • ' + fetched + ' • category ' + data.categoryId;
+    }
+  } catch (e) {
+    view.status.textContent = 'Error: ' + e.message;
+    view.status.classList.add('err');
+  } finally {
+    view.button.disabled = false;
+  }
+}
 document.getElementById('addEvent').onclick = async () => {
   const input = document.getElementById('eventInput');
   const value = input.value.trim();
@@ -3194,6 +3515,8 @@ document.getElementById('eventInput').addEventListener('keydown', (e) => {
   }
 });
 document.getElementById('refresh').onclick = () => load(true);
+discoveryViews.sport.button.onclick = () => loadDiscovery('sport');
+discoveryViews['premier-league'].button.onclick = () => loadDiscovery('premier-league');
 document.getElementById('relogin').onclick = async () => {
   toast('Logging in…');
   try {
@@ -3458,7 +3781,7 @@ if (!ids.length) {
 </html>`;
 
 // === Startup ===
-{
+if (import.meta.main) {
   const loaded = await loadConfig();
   config = loaded.config;
   if (loaded.mutated) await saveConfig();

@@ -299,6 +299,32 @@ Open <http://localhost:8090>. `voyo.json` is read/written next to the executable
 
 Override with `VOYO_UI_BASIC_AUTH_USER` and `VOYO_UI_BASIC_AUTH_PASS`.
 
+### Live event discovery
+
+The Shaka UI has two independent controls above the regular channel list:
+
+- **Discover Sport** fetches Voyo overview category `6` and displays the
+  `Sport Live` carousel.
+- **Discover Premier League** fetches category `334` by default and displays
+  the `Premier League Live` carousel.
+
+Every click requests fresh upstream data for that control. A successful refresh
+replaces only that section. If a later refresh fails, the UI keeps the last
+successful entries visible and marks them stale. Discovered events reuse the
+existing Play, copy, VLC, playlist, DRM, stream-info, and diagnostic routes; no
+stream is probed until one of those playback routes is used.
+
+Override the Premier League category when Voyo changes it:
+
+```sh
+VOYO_PREMIER_LEAGUE_CATEGORY_ID=334 \
+deno run --allow-read --allow-write --allow-net --allow-env --allow-run voyo-shaka.ts
+```
+
+For Docker Compose, set `VOYO_PREMIER_LEAGUE_CATEGORY_ID` in the shell or
+`v2/.env`; `docker-compose.shaka.yaml` passes it into the container and defaults
+it to `334`.
+
 ### Cross-compile
 
 `deno compile --target=…` produces a binary for another OS/arch. Supported targets (from any host):
@@ -327,6 +353,8 @@ Caveats: Linux targets are glibc (no musl/Alpine); the snapshot for each new tar
 - `http://<host>:8090/api/keys/<channel-id>` — debug: hex content keys from sidecar (`?force=1` to bypass cache)
 - `http://<host>:8090/play/<channel-id>` — in-browser Shaka player; works for DRM in Chrome/Edge (Widevine via license proxy)
 - `http://<host>:8090/mosaic?ids=<id1>,<id2>,…` — grid of independent players, each its own audio-output picker
+- `http://<host>:8090/api/discovery/sport?force=1` — refresh and return Sport live-event discoveries
+- `http://<host>:8090/api/discovery/premier-league?force=1` — refresh and return Premier League live-event discoveries
 - `http://<host>:8090/api/stream/<channel-id>` — JSON `{manifestUrl, isDrm, licenseUrl}` for custom players
 - `http://<host>:8090/license/<channel-id>` — Widevine license proxy (POST challenge → license bytes; injects upstream auth headers)
 
@@ -388,6 +416,7 @@ Then in VLC: open `http://<host>:8090/vlc/<channel-id>/index.m3u8`, or import `h
 | `VOYO_CDM_DEVICE` | `./l3.wvd`            | path to your L3 device file |
 | `VOYO_MP4DECRYPT` | `mp4decrypt`          | Bento4 `mp4decrypt` binary path |
 | `VOYO_SHAKA_PACKAGER` | `packager`         | Shaka Packager binary path for `voyo-shaka.ts` |
+| `VOYO_PREMIER_LEAGUE_CATEGORY_ID` | `334` | Voyo overview category used by Premier League discovery |
 | `VOYO_UI_BASIC_AUTH_USER` | `adm`          | UI/browser Basic Auth username for `voyo-shaka.ts` |
 | `VOYO_UI_BASIC_AUTH_PASS` | `fvoyo`        | UI/browser Basic Auth password for `voyo-shaka.ts` |
 
