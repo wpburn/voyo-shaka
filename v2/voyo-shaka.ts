@@ -2903,7 +2903,8 @@ async function handle(req: Request): Promise<Response> {
 
   if (method === "GET" && path === "/live.m3u8") {
     // mode=hls   → only non-DRM (legacy default, safest for VLC if CDM is offline)
-    // mode=all   → DRM channels too, via /vlc/<id>/index.m3u8 (needs cdm.py running)
+    // All links use /vlc/<id>/index.m3u8, which resolves HLS vs DRM at playback time.
+    // mode=all   → DRM channels too (needs cdm.py running for DRM playback)
     // mode=vlc   → alias for "all"
     try {
       const mode = url.searchParams.get("mode") ?? "all";
@@ -2913,10 +2914,8 @@ async function handle(req: Request): Promise<Response> {
       const lines = ["#EXTM3U"];
       for (const ch of channels) {
         const routePath = publicRoutePathFor(ch);
-        const target = entryLikelyDrm(ch)
-          ? (includeDrm ? `http://${host}/vlc/${routePath}/index.m3u8` : null)
-          : `http://${host}/live/${routePath}.m3u8`;
-        if (!target) continue;
+        if (!includeDrm && entryLikelyDrm(ch)) continue;
+        const target = `http://${host}/vlc/${routePath}/index.m3u8`;
         lines.push(
           `#EXTINF:-1 tvg-id="${ch.id}" tvg-logo="${ch.img}" group-title="Voyo",${ch.name}`,
         );
@@ -3415,8 +3414,8 @@ function render(channels, target, emptyText) {
       : (c.kind === 'event'
         ? '<span class="meta">' + (c.sourceUrl ? '<a href="' + esc(c.sourceUrl) + '" target="_blank">source</a>' : 'manual event') + (c.lastError ? ' • ' + esc(c.lastError) : '') + '</span>'
         : '');
-    // For DRM channels the VLC-friendly URL is the server-decrypted /vlc/<id>/index.m3u8.
-    const hls = drm ? '/vlc/' + route + '/index.m3u8' : '/live/' + route + '.m3u8';
+    // The VLC route resolves the actual stream type for both channels and events.
+    const hls = '/vlc/' + route + '/index.m3u8';
     const fullHls = location.protocol + '//' + location.host + hls;
     const play = '/play/' + route;
     return '<tr>' +
@@ -3446,7 +3445,7 @@ document.addEventListener('click', (e) => {
       .catch((err) => toast('Error: ' + err.message, true));
     return;
   }
-  const url = location.protocol + '//' + location.host + (btn.dataset.url || '/live/' + btn.dataset.id + '.m3u8');
+  const url = location.protocol + '//' + location.host + (btn.dataset.url || '/vlc/' + btn.dataset.id + '/index.m3u8');
   if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(url).then(() => toast('Copied: ' + url));
     return;

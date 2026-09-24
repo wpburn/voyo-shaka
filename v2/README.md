@@ -347,9 +347,9 @@ Caveats: Linux targets are glibc (no musl/Alpine); the snapshot for each new tar
 ## URLs
 
 - `http://<host>:8090/` — channel list, copy buttons, mosaic builder
-- `http://<host>:8090/live.m3u8` — combined VLC playlist. `?mode=all` (default) includes DRM channels via `/vlc/…` (needs CDM sidecar); `?mode=hls` for non-DRM only.
+- `http://<host>:8090/live.m3u8` — combined VLC playlist. All links use `/vlc/…`, which detects the actual stream type at playback time. `?mode=all` (default) includes DRM channels; `?mode=hls` retains the metadata-based DRM filter.
 - `http://<host>:8090/live/<channel-id>.m3u8` — single channel HLS (non-DRM only)
-- `http://<host>:8090/vlc/<channel-id>/index.m3u8` — **DRM channel decrypted on the server, plain HLS for VLC** (needs `cdm.py` running)
+- `http://<host>:8090/vlc/<channel-id>/index.m3u8` — VLC/IPTV playback for all channels: HLS passes through directly; DRM is decrypted on the server (DRM playback needs `cdm.py` running).
 - `http://<host>:8090/api/keys/<channel-id>` — debug: hex content keys from sidecar (`?force=1` to bypass cache)
 - `http://<host>:8090/play/<channel-id>` — in-browser Shaka player; works for DRM in Chrome/Edge (Widevine via license proxy)
 - `http://<host>:8090/mosaic?ids=<id1>,<id2>,…` — grid of independent players, each its own audio-output picker
